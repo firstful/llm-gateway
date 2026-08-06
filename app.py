@@ -57,7 +57,7 @@ AGNO_ORDER = [k for k in os.environ.get("AGNO_ORDER", "ocg,dpsk").split(",") if 
 # fallback on these upstream outcomes for auto/AGNO chains
 _FALLBACK_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 
-app = FastAPI(title=APP_NAME, version="1.2.0")
+app = FastAPI(title=APP_NAME, version="1.2.1")
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -218,23 +218,48 @@ def _rag_request_headers(request: Request) -> tuple[str | None, bool, bool]:
 
 
 async def _rag_retrieve(query: str, consumer: str | None, docs_enabled: bool) -> list[dict]:
-    """Ask the embeddings service for top-k semantic hits. Fail-open: [] on any error."""
+    """Ask the embeddings service for top-k semantic hits. Fail-open: [] on any error.
+
+    Balanced retrieval: when docs are enabled, query docs and sessions SEPARATELY
+    (top_k//2 each) and interleave. Session narratives routinely outrank docs on
+    operational queries (observed: 0.63 session vs 0.31 docs for infra-doctor) —
+    a single pooled top-k starves the docs answer. Docs and sessions both get a seat.
+    """
     if not RAG_ENABLED:
         return []
-    payload: dict = {"query": query, "top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE}
-    # consumer scoping: pass consumers=[id] so session chunks are restricted to this
-    # consumer; docs (shared, consumer NULL) always included by the service.
+
+    async def _search(payload: dict) -> list[dict]:
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.post(f"{RAG_BASE_URL}/search", json=payload)
+                r.raise_for_status()
+                return r.json().get("results", [])
+        except Exception:
+            return []
+
+    per_source_k = max(1, (RAG_TOP_K + 1) // 2)  # ceil: TOP_K=3 → 2+2, capped to 3 at the end
+    merged: list[dict] = []
+
+    # sessions bucket (scoped to consumer when present)
+    sess_payload: dict = {"query": query, "top_k": per_source_k, "min_score": RAG_MIN_SCORE, "sources": ["session"]}
     if consumer:
-        payload["consumers"] = [consumer]
-    if not docs_enabled:
-        payload["sources"] = ["session"]
-    try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.post(f"{RAG_BASE_URL}/search", json=payload)
-            r.raise_for_status()
-            return r.json().get("results", [])
-    except Exception:
-        return []
+        sess_payload["consumers"] = [consumer]
+    merged.extend(await _search(sess_payload))
+
+    # docs bucket (shared, always included when enabled)
+    if docs_enabled:
+        merged.extend(await _search({"query": query, "top_k": per_source_k, "min_score": RAG_MIN_SCORE, "sources": ["docs"]}))
+
+    # interleave: session, docs, session, docs... (stable by source bucket order)
+    sessions = [h for h in merged if h.get("source") == "session"]
+    docs = [h for h in merged if h.get("source") == "docs"]
+    out: list[dict] = []
+    for i in range(max(len(sessions), len(docs))):
+        if i < len(sessions):
+            out.append(sessions[i])
+        if i < len(docs):
+            out.append(docs[i])
+    return out[:RAG_TOP_K]
 
 
 def _rag_system_message(query: str, hits: list[dict]) -> str:
