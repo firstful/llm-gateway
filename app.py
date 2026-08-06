@@ -11,6 +11,7 @@ providers. Model names are prefixed by provider (case-insensitive):
 LAN-only service (llm.homelab.internal); never exposed through the tunnel.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -38,6 +39,20 @@ RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
 RAG_MIN_SCORE = float(os.environ.get("RAG_MIN_SCORE", "0.15"))
 RAG_MAX_CHARS = int(os.environ.get("RAG_MAX_CHARS", "1800"))
 
+# Live session ingestion (v1.3.0) — tee every turn through a deferred queue into
+# the embeddings service. The gateway sees each request/response as it happens,
+# so it enqueues the user msg + assistant reply as a paired chunk
+# (id 'live:<consumer>:<ts>'). A background flusher drains the queue to
+# /ingest/sessions. This is the PRIMARY session-memory path (near-real-time);
+# the NFS snapshot (/refresh sources) is backup/catchup only (initial backfill +
+# recovery after queue loss).
+LIVE_INGEST_ENABLED = os.environ.get("LIVE_INGEST_ENABLED", "1") not in ("0", "false", "False")
+LIVE_FLUSH_SECONDS = float(os.environ.get("LIVE_FLUSH_SECONDS", "3"))
+LIVE_FLUSH_BATCH = int(os.environ.get("LIVE_FLUSH_BATCH", "20"))
+
+_live_queue: asyncio.Queue = asyncio.Queue()
+_live_flusher_task = None
+
 # provider key -> (label, base_url, api_key)
 PROVIDERS = {
     "ocg": {
@@ -57,7 +72,7 @@ AGNO_ORDER = [k for k in os.environ.get("AGNO_ORDER", "ocg,dpsk").split(",") if 
 # fallback on these upstream outcomes for auto/AGNO chains
 _FALLBACK_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 
-app = FastAPI(title=APP_NAME, version="1.2.2")
+app = FastAPI(title=APP_NAME, version="1.3.0")
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -164,7 +179,84 @@ async def health():
         "app": APP_NAME,
         "providers": list(PROVIDERS),
         "rag": {"enabled": RAG_ENABLED, "base_url": RAG_BASE_URL},
+        "live_ingest": {"enabled": LIVE_INGEST_ENABLED, "queued": _live_queue.qsize()},
     }
+
+
+# ---------------- live session ingestion (deferred queue) ----------------
+
+def _tee_live_turn(consumer: str | None, user_msg: str, reply: str):
+    """Enqueue one turn pair for background embedding. Fail-safe: never raises,
+    never blocks the response path. consumer None = nothing to attribute → skip."""
+    if not LIVE_INGEST_ENABLED or not consumer or not user_msg.strip():
+        return
+    try:
+        _live_queue.put_nowait({
+            "consumer": consumer,
+            "user_msg": user_msg.strip(),
+            "reply": reply.strip() if reply else "",
+            "ts": int(time.time()),
+        })
+    except Exception:
+        pass
+
+
+async def _live_flusher():
+    """Background task: drain the queue in batches to embeddings /ingest/sessions."""
+    while True:
+        try:
+            await asyncio.sleep(LIVE_FLUSH_SECONDS)
+            batch: list[dict] = []
+            while not _live_queue.empty() and len(batch) < LIVE_FLUSH_BATCH:
+                try:
+                    batch.append(_live_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            if not batch:
+                continue
+            # group by consumer, one POST per consumer
+            by_consumer: dict[str, list[dict]] = {}
+            for item in batch:
+                by_consumer.setdefault(item["consumer"], []).append(item)
+            for consumer, items in by_consumer.items():
+                chunks = []
+                for item in items:
+                    text = f"user: {item['user_msg']}"
+                    if item["reply"]:
+                        text += f"\nassistant: {item['reply']}"
+                    chunks.append({
+                        "id": f"live:{consumer}:{item['ts']}",
+                        "title": f"live {consumer} {time.strftime('%Y-%m-%d %H:%M', time.localtime(item['ts']))}",
+                        "text": text,
+                        "meta": {"consumer": consumer, "live": True, "ts": item["ts"]},
+                    })
+                try:
+                    async with httpx.AsyncClient(timeout=10) as c:
+                        r = await c.post(
+                            f"{RAG_BASE_URL}/ingest/sessions",
+                            json={"consumer": consumer, "chunks": chunks},
+                        )
+                        r.raise_for_status()
+                except Exception:
+                    # fail-open: drop the batch — NFS snapshot catchup covers it
+                    pass
+        except Exception:
+            await asyncio.sleep(LIVE_FLUSH_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_live_flusher():
+    global _live_flusher_task
+    if LIVE_INGEST_ENABLED and _live_flusher_task is None:
+        _live_flusher_task = asyncio.create_task(_live_flusher())
+
+
+@app.on_event("shutdown")
+async def _stop_live_flusher():
+    global _live_flusher_task
+    if _live_flusher_task:
+        _live_flusher_task.cancel()
+        _live_flusher_task = None
 
 
 @app.get("/v1/models")
@@ -289,6 +381,25 @@ def _last_user_message(messages: list) -> str:
     return ""
 
 
+def _sse_reply_text(raw: bytes) -> str:
+    """Reconstruct assistant content from OpenAI SSE stream bytes."""
+    parts = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload in ("[DONE]", ""):
+            continue
+        try:
+            obj = json.loads(payload)
+            delta = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content")
+            if isinstance(delta, str):
+                parts.append(delta)
+        except Exception:
+            continue
+    return "".join(parts)
+
+
 async def _inject_rag(messages: list, consumer: str | None, docs_enabled: bool) -> list:
     """Return messages with a RAG context system message injected (fail-open: unchanged)."""
     query = _last_user_message(messages)
@@ -343,6 +454,14 @@ async def chat_completions(request: Request):
                 content = r.json()
             except Exception:
                 content = None
+            # live session ingest: tee the turn (deferred queue) on a 2xx
+            if r.status_code < 400:
+                consumer, _, _ = _rag_request_headers(request)
+                _tee_live_turn(
+                    consumer,
+                    _last_user_message(body.get("messages") or []),
+                    ((content or {}).get("choices") or [{}])[0].get("message", {}).get("content") or "",
+                )
             await client.aclose()
             if content is not None:
                 return JSONResponse(status_code=r.status_code, content=content)
@@ -370,10 +489,24 @@ async def chat_completions(request: Request):
             continue
 
         async def stream(client=client, r=r):
+            chunks = []
             try:
                 async for chunk in r.aiter_bytes():
+                    chunks.append(chunk)
                     yield chunk
             finally:
+                # live session ingest: reconstruct the assistant reply from SSE deltas
+                if r.status_code < 400:
+                    try:
+                        consumer, _, _ = _rag_request_headers(request)
+                        reply = _sse_reply_text(b"".join(chunks))
+                        _tee_live_turn(
+                            consumer,
+                            _last_user_message(body.get("messages") or []),
+                            reply,
+                        )
+                    except Exception:
+                        pass
                 await client.aclose()
 
         return StreamingResponse(
@@ -543,6 +676,14 @@ async def responses(request: Request):
         except Exception:
             await client.aclose()
             raise _ApiError(502, f"upstream returned non-JSON (HTTP {r.status_code})")
+        # live session ingest: tee the turn on a 2xx
+        if r.status_code < 400:
+            consumer, _, _ = _rag_request_headers(request)
+            _tee_live_turn(
+                consumer,
+                _last_user_message(chat_payload["messages"]),
+                ((chat.get("choices") or [{}])[0].get("message", {}).get("content") or ""),
+            )
         await client.aclose()
         if r.status_code >= 400:
             return JSONResponse(status_code=r.status_code, content=chat)
