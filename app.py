@@ -97,7 +97,7 @@ async def _api_error_handler(_req, exc: _ApiError):
     )
 
 
-def _resolve(model: str | None) -> list[tuple[str, str]]:
+async def _resolve(model: str | None) -> list[tuple[str, str]]:
     """Return ordered (provider_key, upstream_model) chain for a model name."""
     if not model or not str(model).strip():
         raise _ApiError(400, "model is required")
@@ -259,7 +259,7 @@ async def chat_completions(request: Request):
     except Exception:
         raise _ApiError(400, "request body must be JSON")
     model = body.get("model")
-    routes = _resolve(model)
+    routes = await _resolve(model)
     want_stream = bool(body.get("stream"))
 
     # RAG: inject retrieved context into the message list (fail-open)
@@ -466,7 +466,7 @@ async def responses(request: Request):
     if body.get("stream"):
         raise _ApiError(501, "streaming /v1/responses is not supported yet; use stream:false or /v1/chat/completions")
 
-    routes = _resolve(model)
+    routes = await _resolve(model)
     last_err = None
     for key, upstream in routes:
         payload = dict(chat_payload)
