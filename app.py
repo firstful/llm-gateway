@@ -57,7 +57,7 @@ AGNO_ORDER = [k for k in os.environ.get("AGNO_ORDER", "ocg,dpsk").split(",") if 
 # fallback on these upstream outcomes for auto/AGNO chains
 _FALLBACK_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 
-app = FastAPI(title=APP_NAME, version="1.2.1")
+app = FastAPI(title=APP_NAME, version="1.2.2")
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -274,7 +274,9 @@ def _rag_system_message(query: str, hits: list[dict]) -> str:
         who = f" [{consumer}]" if consumer else ""
         parts.append(f"--- [{src}{who}] {title} (score {score})\n{text}")
     return (
-        "Retrieved context (homelab docs + session history, use only if relevant):\n\n"
+        "The following is authoritative context from the homelab operator's docs and "
+        "session history (retrieved via RAG). It is FACT, not a hint — prefer it over "
+        "guessing or tool checks when it answers the user's question:\n\n"
         + "\n\n".join(parts)
     )
 
