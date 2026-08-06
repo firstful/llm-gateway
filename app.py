@@ -25,9 +25,13 @@ PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
 MODELS_CACHE_TTL = int(os.environ.get("MODELS_CACHE_TTL", "300"))
 
-# RAG injection (v1.1.0) — query the embeddings service with the last user
-# message and prepend retrieved context as a system message. Fail-open:
-# any error leaves the request untouched.
+# RAG injection (v1.2.0) — header-driven control plane:
+#   X-Consumer: <id>       scope session embeddings to this consumer (docs stay shared)
+#   X-RAG-Docs: 1|0        include docs source (default on)
+#   X-RAG-Optin: 1|0       master switch — 0 disables RAG for this request (default on)
+# Behavior is backward-compatible: a request with NO RAG headers behaves exactly like
+# v1.1 (docs + all sessions, opt-in on). Fail-open: any search error leaves the
+# request untouched.
 RAG_ENABLED = os.environ.get("RAG_ENABLED", "1") not in ("0", "false", "False")
 RAG_BASE_URL = os.environ.get("RAG_BASE_URL", "http://embeddings.homelab.internal").rstrip("/")
 RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
@@ -53,7 +57,7 @@ AGNO_ORDER = [k for k in os.environ.get("AGNO_ORDER", "ocg,dpsk").split(",") if 
 # fallback on these upstream outcomes for auto/AGNO chains
 _FALLBACK_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
+app = FastAPI(title=APP_NAME, version="1.2.0")
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -197,16 +201,36 @@ async def list_models():
     }
 
 
-async def _rag_retrieve(query: str) -> list[dict]:
+def _rag_request_headers(request: Request) -> tuple[str | None, bool, bool]:
+    """Extract the RAG control plane from request headers.
+
+    Returns (consumer, docs_enabled, optin). Absent headers = legacy defaults:
+    consumer None (all sessions), docs on, opt-in on. Header value "0"/"false"
+    disables; anything else enables.
+    """
+    hdr = request.headers
+    consumer = (hdr.get("x-consumer") or "").strip() or None
+    docs_raw = (hdr.get("x-rag-docs") or "").strip().lower()
+    optin_raw = (hdr.get("x-rag-optin") or "").strip().lower()
+    docs_enabled = docs_raw not in ("0", "false", "no")
+    optin = optin_raw not in ("0", "false", "no")
+    return consumer, docs_enabled, optin
+
+
+async def _rag_retrieve(query: str, consumer: str | None, docs_enabled: bool) -> list[dict]:
     """Ask the embeddings service for top-k semantic hits. Fail-open: [] on any error."""
     if not RAG_ENABLED:
         return []
+    payload: dict = {"query": query, "top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE}
+    # consumer scoping: pass consumers=[id] so session chunks are restricted to this
+    # consumer; docs (shared, consumer NULL) always included by the service.
+    if consumer:
+        payload["consumers"] = [consumer]
+    if not docs_enabled:
+        payload["sources"] = ["session"]
     try:
         async with httpx.AsyncClient(timeout=5) as c:
-            r = await c.post(
-                f"{RAG_BASE_URL}/search",
-                json={"query": query, "top_k": RAG_TOP_K, "min_score": RAG_MIN_SCORE},
-            )
+            r = await c.post(f"{RAG_BASE_URL}/search", json=payload)
             r.raise_for_status()
             return r.json().get("results", [])
     except Exception:
@@ -218,10 +242,12 @@ def _rag_system_message(query: str, hits: list[dict]) -> str:
     parts = []
     for h in hits[:RAG_TOP_K]:
         src = h.get("source", "?")
+        consumer = h.get("consumer") or ""
         title = h.get("title", "")
         text = (h.get("text") or "")[:RAG_MAX_CHARS]
         score = h.get("score", 0)
-        parts.append(f"--- [{src}] {title} (score {score})\n{text}")
+        who = f" [{consumer}]" if consumer else ""
+        parts.append(f"--- [{src}{who}] {title} (score {score})\n{text}")
     return (
         "Retrieved context (homelab docs + session history, use only if relevant):\n\n"
         + "\n\n".join(parts)
@@ -236,12 +262,12 @@ def _last_user_message(messages: list) -> str:
     return ""
 
 
-async def _inject_rag(messages: list) -> list:
+async def _inject_rag(messages: list, consumer: str | None, docs_enabled: bool) -> list:
     """Return messages with a RAG context system message injected (fail-open: unchanged)."""
     query = _last_user_message(messages)
     if not query:
         return messages
-    hits = await _rag_retrieve(query)
+    hits = await _rag_retrieve(query, consumer, docs_enabled)
     if not hits:
         return messages
     ctx = _rag_system_message(query, hits)
@@ -262,12 +288,14 @@ async def chat_completions(request: Request):
     routes = await _resolve(model)
     want_stream = bool(body.get("stream"))
 
-    # RAG: inject retrieved context into the message list (fail-open)
+    # RAG: header-driven injection (fail-open; absent headers = legacy defaults)
     if RAG_ENABLED and body.get("rag") is not False:
-        messages = body.get("messages") or []
-        if isinstance(messages, list):
-            messages = await _inject_rag(messages)
-            body = {**body, "messages": messages}
+        consumer, docs_enabled, optin = _rag_request_headers(request)
+        if optin:
+            messages = body.get("messages") or []
+            if isinstance(messages, list):
+                messages = await _inject_rag(messages, consumer, docs_enabled)
+                body = {**body, "messages": messages}
 
     if not want_stream:
         last_err = None
@@ -443,9 +471,11 @@ async def responses(request: Request):
     }
     if not chat_payload["messages"]:
         raise _ApiError(400, "input is empty")
-    # RAG: inject retrieved context into the message list (fail-open)
+    # RAG: header-driven injection (fail-open; absent headers = legacy defaults)
     if RAG_ENABLED and body.get("rag") is not False:
-        chat_payload["messages"] = await _inject_rag(chat_payload["messages"])
+        consumer, docs_enabled, optin = _rag_request_headers(request)
+        if optin:
+            chat_payload["messages"] = await _inject_rag(chat_payload["messages"], consumer, docs_enabled)
     for src, dst in (
         ("max_output_tokens", "max_tokens"),
         ("temperature", "temperature"),
