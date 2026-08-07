@@ -72,7 +72,93 @@ AGNO_ORDER = [k for k in os.environ.get("AGNO_ORDER", "ocg,dpsk").split(",") if 
 # fallback on these upstream outcomes for auto/AGNO chains
 _FALLBACK_STATUS = {401, 403, 408, 429, 500, 502, 503, 504}
 
-app = FastAPI(title=APP_NAME, version="1.3.0")
+# DeepSeek thinking-mode echo: upstream (OCG/DPSK deepseek-v4-flash) REQUIRES
+# `reasoning_content` to be echoed back on assistant tool_call messages in
+# follow-up turns, or it 400s ("The reasoning_content in the thinking mode must
+# be passed back to the API"). Some clients (Hermes' non-streaming path, bare
+# OpenAI clients) omit it. We cache what the upstream returns (keyed by
+# tool_call id) and inject it — or an empty echo, which upstream accepts — so
+# multi-turn tool loops never break. Applies to both /v1/chat/completions and
+# /v1/responses.
+_reasoning_echo: dict[str, str] = {}
+_REASONING_ECHO_MAX = 4096
+
+
+def _is_thinking_model(name: str) -> bool:
+    low = (name or "").lower()
+    return any(tok in low for tok in ("deepseek", "glm", "reasoner", "think"))
+
+
+def _cache_reasoning_echo(content: dict | None) -> None:
+    """Cache reasoning_content from an upstream chat.completions response,
+    keyed by the tool_call ids it accompanied."""
+    if not isinstance(content, dict):
+        return
+    for choice in content.get("choices") or []:
+        msg = choice.get("message") or {}
+        rc = msg.get("reasoning_content")
+        if not rc:
+            continue
+        for tc in msg.get("tool_calls") or []:
+            cid = tc.get("id") if isinstance(tc, dict) else None
+            if cid:
+                _reasoning_echo[cid] = rc
+    if len(_reasoning_echo) > _REASONING_ECHO_MAX:
+        for k in list(_reasoning_echo)[: len(_reasoning_echo) - _REASONING_ECHO_MAX]:
+            _reasoning_echo.pop(k, None)
+
+
+def _cache_reasoning_echo_from_sse(raw: bytes) -> None:
+    """Harvest reasoning_content + tool_call ids from a streaming SSE body."""
+    pending = ""
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        delta = ((obj.get("choices") or [{}])[0]).get("delta") or {}
+        rc = delta.get("reasoning_content")
+        if rc:
+            pending += rc
+        for tc in delta.get("tool_calls") or []:
+            cid = tc.get("id") if isinstance(tc, dict) else None
+            if cid and pending:
+                _reasoning_echo[cid] = pending
+        if ((obj.get("choices") or [{}])[0]).get("finish_reason"):
+            pending = ""
+    if len(_reasoning_echo) > _REASONING_ECHO_MAX:
+        for k in list(_reasoning_echo)[: len(_reasoning_echo) - _REASONING_ECHO_MAX]:
+            _reasoning_echo.pop(k, None)
+
+
+def _ensure_reasoning_echo(messages, thinking: bool) -> None:
+    """Guarantee assistant tool_call messages carry reasoning_content when the
+    upstream model is a thinking model. Injects cached reasoning (best) or an
+    empty echo (accepted by upstream) so tool loops never 400."""
+    if not thinking or not isinstance(messages, list):
+        return
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        if not msg.get("tool_calls"):
+            continue
+        if msg.get("reasoning_content") is not None:
+            continue  # client already echoed it (explicitly or not)
+        injected = ""
+        for tc in msg.get("tool_calls") or []:
+            cid = tc.get("id") if isinstance(tc, dict) else None
+            if cid and cid in _reasoning_echo:
+                injected = _reasoning_echo[cid]
+                break
+        msg["reasoning_content"] = injected
+
+app = FastAPI(title=APP_NAME, version="1.4.0")
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -440,6 +526,7 @@ async def chat_completions(request: Request):
         for key, upstream in routes:
             payload = dict(body)
             payload["model"] = upstream
+            _ensure_reasoning_echo(payload.get("messages"), _is_thinking_model(upstream))
             try:
                 client, r = await _upstream("POST", "/chat/completions", payload, key)
             except (httpx.TransportError, httpx.TimeoutException) as e:
@@ -462,6 +549,9 @@ async def chat_completions(request: Request):
                     _last_user_message(body.get("messages") or []),
                     ((content or {}).get("choices") or [{}])[0].get("message", {}).get("content") or "",
                 )
+                # remember reasoning_content so follow-up tool loops echo it
+                if _is_thinking_model(upstream):
+                    _cache_reasoning_echo(content)
             await client.aclose()
             if content is not None:
                 return JSONResponse(status_code=r.status_code, content=content)
@@ -473,6 +563,7 @@ async def chat_completions(request: Request):
     for key, upstream in routes:
         payload = dict(body)
         payload["model"] = upstream
+        _ensure_reasoning_echo(payload.get("messages"), _is_thinking_model(upstream))
         try:
             client, r = await _upstream("POST", "/chat/completions", payload, key)
         except (httpx.TransportError, httpx.TimeoutException) as e:
@@ -507,6 +598,9 @@ async def chat_completions(request: Request):
                         )
                     except Exception:
                         pass
+                    # remember reasoning_content from the stream for follow-up loops
+                    if _is_thinking_model(upstream):
+                        _cache_reasoning_echo_from_sse(b"".join(chunks))
                 await client.aclose()
 
         return StreamingResponse(
@@ -547,7 +641,7 @@ def _responses_input_to_messages(inp, instructions=None):
             if text.strip():
                 messages.append({"role": role, "content": text})
         elif t == "function_call":
-            messages.append({
+            msg: dict = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
@@ -558,7 +652,12 @@ def _responses_input_to_messages(inp, instructions=None):
                         "arguments": item.get("arguments") or "{}",
                     },
                 }],
-            })
+            }
+            # DeepSeek thinking-mode requires reasoning_content echoed back on
+            # assistant tool_call messages; preserve it through the round-trip.
+            if item.get("reasoning_content"):
+                msg["reasoning_content"] = item["reasoning_content"]
+            messages.append(msg)
         elif t == "function_call_output":
             messages.append({
                 "role": "tool",
@@ -586,14 +685,17 @@ def _chat_to_response(chat: dict, model_alias: str) -> dict:
         })
     for tc in msg.get("tool_calls") or []:
         fn = tc.get("function", {}) or {}
-        output.append({
+        fc_item = {
             "id": f"fc_{uuid.uuid4().hex}",
             "type": "function_call",
             "status": "completed",
             "call_id": tc.get("id", ""),
             "name": fn.get("name", ""),
             "arguments": fn.get("arguments", "{}"),
-        })
+        }
+        if msg.get("reasoning_content"):
+            fc_item["reasoning_content"] = msg["reasoning_content"]
+        output.append(fc_item)
     usage = chat.get("usage", {}) or {}
     finish = choice.get("finish_reason")
     status = "completed" if finish in (None, "stop", "tool_calls", "length") else "incomplete"
@@ -661,6 +763,7 @@ async def responses(request: Request):
     for key, upstream in routes:
         payload = dict(chat_payload)
         payload["model"] = upstream
+        _ensure_reasoning_echo(payload.get("messages"), _is_thinking_model(upstream))
         try:
             client, r = await _upstream("POST", "/chat/completions", payload, key)
         except (httpx.TransportError, httpx.TimeoutException) as e:
@@ -684,6 +787,9 @@ async def responses(request: Request):
                 _last_user_message(chat_payload["messages"]),
                 ((chat.get("choices") or [{}])[0].get("message", {}).get("content") or ""),
             )
+            # remember reasoning_content so follow-up tool loops echo it
+            if _is_thinking_model(upstream):
+                _cache_reasoning_echo(chat)
         await client.aclose()
         if r.status_code >= 400:
             return JSONResponse(status_code=r.status_code, content=chat)
