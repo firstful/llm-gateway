@@ -16,12 +16,14 @@ import json
 import os
 import time
 import uuid
+from collections import deque
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 APP_NAME = "llm-gateway"
+APP_VERSION = "1.5.0"
 PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
 MODELS_CACHE_TTL = int(os.environ.get("MODELS_CACHE_TTL", "300"))
@@ -158,7 +160,139 @@ def _ensure_reasoning_echo(messages, thinking: bool) -> None:
                 break
         msg["reasoning_content"] = injected
 
-app = FastAPI(title=APP_NAME, version="1.4.0")
+
+# ---------------- request statistics (rolling + telemetry) ----------------
+# Reed 2026-08-07: track per-request stats over time (RAG bytes injected, token
+# usage, latency) so real-world RAG overhead is measurable instead of guessed.
+# In-memory rolling window for GET /stats; optionally flushed to telemetry
+# (raw-text POST, <=4096B) for durable 90-day history. Fail-open everywhere:
+# stats must NEVER break the request path.
+
+_RAG_PREFIX = (
+    "The following is authoritative context from the homelab operator's docs and "
+    "session history (retrieved via RAG)."
+)
+STATS_WINDOW = int(os.environ.get("STATS_WINDOW", "5000"))
+STATS_FLUSH_SECONDS = int(os.environ.get("STATS_FLUSH_SECONDS", "30"))
+TELEMETRY_URL = os.environ.get("TELEMETRY_URL", "").rstrip("/")
+TELEMETRY_MAX_BYTES = int(os.environ.get("TELEMETRY_MAX_BYTES", "3800"))
+
+_stats_window: deque = deque(maxlen=STATS_WINDOW)
+_stats_pending: deque = deque()          # not yet flushed to telemetry
+_stats_since_start: dict = {
+    "requests": 0, "with_rag": 0, "rag_bytes": 0, "rag_chunks": 0,
+    "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+    "latency_ms": 0, "errors": 0, "dropped_telemetry": 0,
+}
+
+
+def _record_stat(rec: dict) -> None:
+    """Append one request record to the rolling window + running totals."""
+    if not isinstance(rec, dict):
+        return
+    _stats_window.append(rec)
+    _stats_pending.append(rec)
+    t = _stats_since_start
+    t["requests"] += 1
+    rag = rec.get("rag") or {}
+    if rag.get("injected"):
+        t["with_rag"] += 1
+        t["rag_bytes"] += rag.get("bytes") or 0
+        t["rag_chunks"] += rag.get("chunks") or 0
+    u = rec.get("usage") or {}
+    t["prompt_tokens"] += u.get("prompt") or 0
+    t["completion_tokens"] += u.get("completion") or 0
+    t["reasoning_tokens"] += u.get("reasoning") or 0
+    t["latency_ms"] += rec.get("latency_ms") or 0
+    if rec.get("status", 0) >= 400:
+        t["errors"] += 1
+
+
+def _rag_meta(messages: list) -> dict:
+    """Extract injected-RAG metadata from the (possibly RAG-prepended) message list."""
+    if not messages or not isinstance(messages[0], dict):
+        return {"injected": False, "chunks": 0, "bytes": 0}
+    first = messages[0]
+    content = first.get("content") or ""
+    if first.get("role") != "system" or not str(content).startswith(_RAG_PREFIX):
+        return {"injected": False, "chunks": 0, "bytes": 0}
+    n_chunks = str(content).count("--- [")
+    return {"injected": True, "chunks": n_chunks, "bytes": len(str(content))}
+
+
+def _sse_usage(raw: bytes) -> dict:
+    """Extract usage from the final SSE chunk if the upstream includes it."""
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if payload in ("[DONE]", ""):
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if obj.get("usage"):
+            u = obj["usage"]
+            return {
+                "prompt": u.get("prompt_tokens", 0),
+                "completion": u.get("completion_tokens", 0),
+                "reasoning": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+            }
+    return {}
+
+
+def _stats_line(rec: dict) -> str:
+    """One compact JSON line for telemetry (~150B). Keys are short to stay far
+    under the 4096-byte telemetry body cap when batched."""
+    rag = rec.get("rag") or {}
+    u = rec.get("usage") or {}
+    return json.dumps({
+        "ts": rec.get("ts", 0),
+        "c": (rec.get("consumer") or "-")[:24],
+        "ep": rec.get("endpoint", "chat"),
+        "s": 1 if rec.get("stream") else 0,
+        "st": rec.get("status", 0),
+        "ms": rec.get("latency_ms", 0),
+        "ri": 1 if rag.get("injected") else 0,
+        "rc": rag.get("chunks", 0),
+        "rb": rag.get("bytes", 0),
+        "pt": u.get("prompt", 0),
+        "ct": u.get("completion", 0),
+        "rt": u.get("reasoning", 0),
+    }, separators=(",", ":"))
+
+
+async def _stats_flusher():
+    """Background task: drain pending stats to telemetry in <=3800B batches.
+    Fail-open: any error drops the batch (counted) — never retried forever."""
+    while True:
+        try:
+            await asyncio.sleep(STATS_FLUSH_SECONDS)
+            if not TELEMETRY_URL or not _stats_pending:
+                continue
+            lines: list[str] = []
+            batch_size = 0
+            while _stats_pending and batch_size < TELEMETRY_MAX_BYTES:
+                line = _stats_line(_stats_pending.popleft())
+                if batch_size + len(line) + 1 > TELEMETRY_MAX_BYTES:
+                    _stats_pending.appendleft(json.loads(line))
+                    break
+                lines.append(line)
+                batch_size += len(line) + 1
+            if not lines:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=5) as c:
+                    r = await c.post(TELEMETRY_URL, content="\n".join(lines))
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"telemetry HTTP {r.status_code}")
+            except Exception:
+                _stats_since_start["dropped_telemetry"] += len(lines)
+        except Exception:
+            await asyncio.sleep(STATS_FLUSH_SECONDS)
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -269,6 +403,75 @@ async def health():
     }
 
 
+@app.get("/stats")
+async def stats(limit: int = 20):
+    """Per-request stats over the rolling window + totals since process start.
+    RAG overhead is visible as rag bytes injected (rag_bytes) against prompt
+    tokens (usage.prompt). limit clamps the recent-request sample."""
+    win = list(_stats_window)
+    n = len(win)
+    rag_recs = [r for r in win if (r.get("rag") or {}).get("injected")]
+    with_rag = len(rag_recs)
+
+    def _pct(arr, p):
+        if not arr:
+            return 0
+        s = sorted(arr)
+        return s[min(len(s) - 1, int(len(s) * p))]
+
+    agg = {
+        "window_requests": n,
+        "window_with_rag": with_rag,
+        "rag_inject_rate_pct": round(100 * with_rag / n, 1) if n else 0,
+        "rag_bytes": {
+            "total": sum((r.get("rag") or {}).get("bytes", 0) for r in rag_recs),
+            "avg": round(sum((r.get("rag") or {}).get("bytes", 0) for r in rag_recs) / with_rag, 1) if with_rag else 0,
+            "p50": _pct([(r.get("rag") or {}).get("bytes", 0) for r in rag_recs], 0.5),
+            "p95": _pct([(r.get("rag") or {}).get("bytes", 0) for r in rag_recs], 0.95),
+        },
+        "rag_tokens_est": {
+            "avg": round(sum((r.get("rag") or {}).get("bytes", 0) for r in rag_recs) / 4 / with_rag, 1) if with_rag else 0,
+        },
+        "prompt_tokens": {
+            "avg": round(sum((r.get("usage") or {}).get("prompt", 0) for r in win) / n, 1) if n else 0,
+            "p95": _pct([(r.get("usage") or {}).get("prompt", 0) for r in win], 0.95),
+        },
+        "completion_tokens": {"avg": round(sum((r.get("usage") or {}).get("completion", 0) for r in win) / n, 1) if n else 0},
+        "reasoning_tokens": {"avg": round(sum((r.get("usage") or {}).get("reasoning", 0) for r in win) / n, 1) if n else 0},
+        "latency_ms": {
+            "avg": round(sum(r.get("latency_ms", 0) for r in win) / n, 1) if n else 0,
+            "p95": _pct([r.get("latency_ms", 0) for r in win], 0.95),
+        },
+        "errors": sum(1 for r in win if r.get("status", 0) >= 400),
+        "by_consumer": {},
+    }
+    for r in win:
+        c = r.get("consumer") or "-"
+        b = agg["by_consumer"].setdefault(c, {"requests": 0, "with_rag": 0, "rag_bytes": 0, "prompt_tokens": 0})
+        b["requests"] += 1
+        if (r.get("rag") or {}).get("injected"):
+            b["with_rag"] += 1
+            b["rag_bytes"] += (r.get("rag") or {}).get("bytes", 0)
+        b["prompt_tokens"] += (r.get("usage") or {}).get("prompt", 0)
+
+    t = dict(_stats_since_start)
+    if t["requests"]:
+        t["avg_latency_ms"] = round(t["latency_ms"] / t["requests"], 1)
+        t["rag_bytes_per_request"] = round(t["rag_bytes"] / t["requests"], 1)
+    else:
+        t["avg_latency_ms"] = 0
+        t["rag_bytes_per_request"] = 0
+    return {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "window": STATS_WINDOW,
+        "aggregates_window": agg,
+        "totals_since_start": t,
+        "telemetry": {"url": TELEMETRY_URL, "flush_seconds": STATS_FLUSH_SECONDS},
+        "recent": list(win)[-max(1, min(limit, 100)):],
+    }
+
+
 # ---------------- live session ingestion (deferred queue) ----------------
 
 def _tee_live_turn(consumer: str | None, user_msg: str, reply: str):
@@ -335,6 +538,8 @@ async def _start_live_flusher():
     global _live_flusher_task
     if LIVE_INGEST_ENABLED and _live_flusher_task is None:
         _live_flusher_task = asyncio.create_task(_live_flusher())
+    if TELEMETRY_URL:
+        asyncio.create_task(_stats_flusher())
 
 
 @app.on_event("shutdown")
@@ -513,17 +718,20 @@ async def chat_completions(request: Request):
     want_stream = bool(body.get("stream"))
 
     # RAG: header-driven injection (fail-open; absent headers = legacy defaults)
+    rag_meta = {"injected": False, "chunks": 0, "bytes": 0}
     if RAG_ENABLED and body.get("rag") is not False:
         consumer, docs_enabled, optin = _rag_request_headers(request)
         if optin:
             messages = body.get("messages") or []
             if isinstance(messages, list):
                 messages = await _inject_rag(messages, consumer, docs_enabled)
+                rag_meta = _rag_meta(messages)
                 body = {**body, "messages": messages}
 
     if not want_stream:
         last_err = None
         for key, upstream in routes:
+            t0 = time.time()
             payload = dict(body)
             payload["model"] = upstream
             _ensure_reasoning_echo(payload.get("messages"), _is_thinking_model(upstream))
@@ -553,6 +761,22 @@ async def chat_completions(request: Request):
                 if _is_thinking_model(upstream):
                     _cache_reasoning_echo(content)
             await client.aclose()
+            # record stats (non-streaming; usage comes from the JSON body)
+            u = (content or {}).get("usage") or {}
+            _record_stat({
+                "ts": int(time.time()),
+                "consumer": _rag_request_headers(request)[0],
+                "endpoint": "chat",
+                "stream": False,
+                "status": r.status_code,
+                "latency_ms": int((time.time() - t0) * 1000),
+                "rag": rag_meta,
+                "usage": {
+                    "prompt": u.get("prompt_tokens", 0),
+                    "completion": u.get("completion_tokens", 0),
+                    "reasoning": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+                },
+            })
             if content is not None:
                 return JSONResponse(status_code=r.status_code, content=content)
             return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
@@ -581,6 +805,7 @@ async def chat_completions(request: Request):
 
         async def stream(client=client, r=r):
             chunks = []
+            t0 = time.time()
             try:
                 async for chunk in r.aiter_bytes():
                     chunks.append(chunk)
@@ -601,6 +826,20 @@ async def chat_completions(request: Request):
                     # remember reasoning_content from the stream for follow-up loops
                     if _is_thinking_model(upstream):
                         _cache_reasoning_echo_from_sse(b"".join(chunks))
+                # record stats (streaming; usage from the final SSE chunk when present)
+                try:
+                    _record_stat({
+                        "ts": int(time.time()),
+                        "consumer": _rag_request_headers(request)[0],
+                        "endpoint": "chat",
+                        "stream": True,
+                        "status": r.status_code,
+                        "latency_ms": int((time.time() - t0) * 1000),
+                        "rag": rag_meta,
+                        "usage": _sse_usage(b"".join(chunks)),
+                    })
+                except Exception:
+                    pass
                 await client.aclose()
 
         return StreamingResponse(
@@ -734,10 +973,12 @@ async def responses(request: Request):
     if not chat_payload["messages"]:
         raise _ApiError(400, "input is empty")
     # RAG: header-driven injection (fail-open; absent headers = legacy defaults)
+    rag_meta = {"injected": False, "chunks": 0, "bytes": 0}
     if RAG_ENABLED and body.get("rag") is not False:
         consumer, docs_enabled, optin = _rag_request_headers(request)
         if optin:
             chat_payload["messages"] = await _inject_rag(chat_payload["messages"], consumer, docs_enabled)
+            rag_meta = _rag_meta(chat_payload["messages"])
     for src, dst in (
         ("max_output_tokens", "max_tokens"),
         ("temperature", "temperature"),
@@ -761,6 +1002,7 @@ async def responses(request: Request):
     routes = await _resolve(model)
     last_err = None
     for key, upstream in routes:
+        t0 = time.time()
         payload = dict(chat_payload)
         payload["model"] = upstream
         _ensure_reasoning_echo(payload.get("messages"), _is_thinking_model(upstream))
@@ -791,6 +1033,22 @@ async def responses(request: Request):
             if _is_thinking_model(upstream):
                 _cache_reasoning_echo(chat)
         await client.aclose()
+        # record stats (non-streaming; usage comes from the chat JSON body)
+        u = chat.get("usage") or {}
+        _record_stat({
+            "ts": int(time.time()),
+            "consumer": _rag_request_headers(request)[0],
+            "endpoint": "responses",
+            "stream": False,
+            "status": r.status_code,
+            "latency_ms": int((time.time() - t0) * 1000),
+            "rag": rag_meta,
+            "usage": {
+                "prompt": u.get("prompt_tokens", 0),
+                "completion": u.get("completion_tokens", 0),
+                "reasoning": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+            },
+        })
         if r.status_code >= 400:
             return JSONResponse(status_code=r.status_code, content=chat)
         return JSONResponse(content=_chat_to_response(chat, str(model)))
