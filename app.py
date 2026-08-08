@@ -5,10 +5,13 @@ providers. Model names are prefixed by provider (case-insensitive):
 
   OCG-<model>    -> opencode-go   (https://opencode.ai/zen/go/v1)
   DPSK-<model>   -> deepseek      (https://api.deepseek.com/v1)
+  LOCAL-<model>  -> local GPU     (llama-ctrl -> llama-server on the RX 470)
   AGNO-<model>   -> any provider that is available AND serving <model>
-  auto           -> OCG-<AUTO_MODEL> with fallback to DPSK-<AUTO_MODEL>
+  auto           -> OCG-<AUTO_MODEL> with fallback to DPSK-<AUTO_MODEL>, then
+                    LOCAL-<LOCAL_MODEL> (final fallback)
 
 LAN-only service (llm.homelab.internal); never exposed through the tunnel.
+Serves a simple chat UI at /ui (model selection + streaming chat).
 """
 
 import asyncio
@@ -20,12 +23,14 @@ from collections import deque
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 APP_NAME = "llm-gateway"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
+# local GPU fallback (llama-ctrl) — the LAST rung of the auto fallback chain
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "lfm2.5-2.6b")
 MODELS_CACHE_TTL = int(os.environ.get("MODELS_CACHE_TTL", "300"))
 
 # RAG injection (v1.2.0) — header-driven control plane:
@@ -66,6 +71,14 @@ PROVIDERS = {
         "label": "DPSK",
         "base_url": os.environ["DPSK_BASE_URL"].rstrip("/"),
         "api_key": os.environ["DPSK_API_KEY"],
+    },
+    "local": {
+        "label": "LOCAL",
+        "base_url": os.environ.get(
+            "LOCAL_BASE_URL", "http://llama-ctrl.llama.svc.cluster.local"
+        ).rstrip("/"),
+        # no auth — llama-ctrl is LAN-only in the same trust domain
+        "api_key": os.environ.get("LOCAL_API_KEY", ""),
     },
 }
 # AGNO preference order (first available+serving wins)
@@ -294,14 +307,23 @@ async def _stats_flusher():
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
+# Simple chat UI (model selection + streaming chat) — served at / and /ui
+_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/ui", include_in_schema=False)
+async def chat_ui():
+    return FileResponse(_UI_PATH, media_type="text/html")
+
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
 
 def _headers(provider: dict) -> dict:
-    return {
-        "Authorization": f"Bearer {provider['api_key']}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if provider.get("api_key"):
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+    return headers
 
 
 async def _provider_models(key: str) -> set[str] | None:
@@ -344,20 +366,22 @@ async def _resolve(model: str | None) -> list[tuple[str, str]]:
     low = m.lower()
 
     if low == "auto":
-        chain = []
-        for k in AGNO_ORDER:
-            chain.append((k, AUTO_MODEL))
+        # cloud providers first (AGNO order), then the local GPU as the
+        # FINAL fallback. local serves LOCAL_MODEL, not AUTO_MODEL.
+        chain = [(k, AUTO_MODEL) for k in AGNO_ORDER if k != "local"]
         if not chain:
             chain = [("ocg", AUTO_MODEL), ("dpsk", AUTO_MODEL)]
+        if "local" in PROVIDERS:
+            chain.append(("local", LOCAL_MODEL))
         return chain
 
-    for key in ("ocg", "dpsk", "agno"):
+    for key in ("ocg", "dpsk", "agno", "local"):
         prefix = key + "-"
         if low.startswith(prefix):
             upstream = m[len(prefix):].strip()
             if not upstream:
                 raise _ApiError(400, f"model '{m}': missing upstream model after '{key}-'")
-            if key in ("ocg", "dpsk"):
+            if key in ("ocg", "dpsk", "local"):
                 return [(key, upstream)]
             # AGNO: providers that are up AND serving this model, in order
             chain = []
@@ -373,7 +397,7 @@ async def _resolve(model: str | None) -> list[tuple[str, str]]:
 
     raise _ApiError(
         404,
-        f"unknown model '{m}'. Use a provider prefix (OCG-/DPSK-/AGNO-) or 'auto'.",
+        f"unknown model '{m}'. Use a provider prefix (OCG-/DPSK-/LOCAL-/AGNO-) or 'auto'.",
     )
 
 

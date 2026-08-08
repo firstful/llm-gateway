@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm — model chat</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: #111318; color: #e8eaf0; height: 100vh; display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+    background: #171a21; border-bottom: 1px solid #262a33; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 600; }
+  select {
+    background: #1f232c; color: #e8eaf0; border: 1px solid #333a45;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px; min-width: 240px;
+  }
+  #status { font-size: 12px; color: #8b93a3; margin-left: auto; }
+  #status.ok { color: #4ade80; }
+  main { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.5;
+         font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: #2456c9; }
+  .msg.assistant { align-self: flex-start; background: #1f232c; border: 1px solid #2c313c; }
+  .msg.err { align-self: center; background: #3a1d1d; border: 1px solid #7a2a2a; color: #ffb4b4; }
+  .msg code { background: #0d0f13; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .msg pre { background: #0d0f13; padding: 10px; border-radius: 8px; overflow-x: auto; }
+  .msg pre code { padding: 0; }
+  .meta { font-size: 11px; color: #6b7280; margin-top: 6px; }
+  .typing::after { content: "▍"; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  footer { display: flex; gap: 8px; padding: 12px 16px; background: #171a21;
+           border-top: 1px solid #262a33; }
+  textarea {
+    flex: 1; resize: none; background: #1f232c; color: #e8eaf0; border: 1px solid #333a45;
+    border-radius: 8px; padding: 10px 12px; font: inherit; font-size: 14px; min-height: 44px;
+  }
+  button {
+    background: #2456c9; color: #fff; border: 0; border-radius: 8px; padding: 10px 18px;
+    font: inherit; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost { background: #262a33; }
+</style>
+</head>
+<body>
+<header>
+  <h1>llm chat</h1>
+  <select id="model"></select>
+  <button class="ghost" id="clear" title="Clear conversation">clear</button>
+  <span id="status"></span>
+</header>
+<main id="msgs"></main>
+<footer>
+  <textarea id="input" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send">Send</button>
+  <button class="ghost" id="stop" disabled>Stop</button>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const msgs = [], modelSel = $("model");
+let history = [];
+let controller = null;
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function render(text) {
+  // code fences first, then inline code, then escape the rest
+  const parts = text.split(/```/);
+  return parts.map((p, i) => {
+    if (i % 2 === 1) {
+      const firstNl = p.indexOf("\n");
+      const lang = firstNl > -1 ? p.slice(0, firstNl) : "";
+      const code = firstNl > -1 ? p.slice(firstNl + 1) : p;
+      return `<pre><code>${esc(code)}</code></pre>`;
+    }
+    return esc(p).replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`);
+  }).join("");
+}
+
+function addMsg(role, text, meta) {
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = text;
+  if (meta) { const m = document.createElement("div"); m.className = "meta"; m.textContent = meta; el.appendChild(m); }
+  $("msgs").appendChild(el);
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+  return el;
+}
+
+async function loadModels() {
+  try {
+    const r = await fetch("/v1/models");
+    const j = await r.json();
+    const ids = (j.data || []).map((m) => m.id);
+    ids.sort((a, b) => (a === "auto" ? -1 : b === "auto" ? 1 : a.localeCompare(b)));
+    modelSel.innerHTML = "";
+    for (const id of ids) {
+      const o = document.createElement("option");
+      o.value = id; o.textContent = id;
+      modelSel.appendChild(o);
+    }
+    $("status").textContent = ids.length + " models";
+    $("status").className = "ok";
+  } catch (e) {
+    $("status").textContent = "models: unreachable";
+  }
+}
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text) return;
+  $("input").value = "";
+  addMsg("user", esc(text));
+  history.push({ role: "user", content: text });
+
+  const bubble = addMsg("assistant", "");
+  bubble.classList.add("typing");
+  let acc = "";
+  $("send").disabled = true; $("stop").disabled = false;
+  controller = new AbortController();
+
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: modelSel.value,
+        messages: history,
+        stream: true,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error((err.error && err.error.message) || ("HTTP " + res.status));
+    }
+    if (!res.body) throw new Error("no stream");
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const j = JSON.parse(payload);
+          const delta = (j.choices && j.choices[0] && j.choices[0].delta && j.choices[0].delta.content) || "";
+          acc += delta;
+          bubble.classList.remove("typing");
+          bubble.innerHTML = render(acc);
+          $("msgs").scrollTop = $("msgs").scrollHeight;
+        } catch (_) { /* keepalive or partial */ }
+      }
+    }
+    if (!acc) acc = "(empty response)";
+    bubble.innerHTML = render(acc);
+    history.push({ role: "assistant", content: acc });
+  } catch (e) {
+    if (e.name !== "AbortError") {
+      bubble.classList.remove("typing");
+      bubble.className = "msg err";
+      bubble.textContent = "Error: " + e.message;
+    }
+  } finally {
+    bubble.classList.remove("typing");
+    controller = null;
+    $("send").disabled = false; $("stop").disabled = true;
+    $("input").focus();
+  }
+}
+
+$("send").onclick = send;
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("stop").onclick = () => controller && controller.abort();
+$("clear").onclick = () => {
+  history = []; $("msgs").innerHTML = "";
+  addMsg("assistant", "Conversation cleared. Pick a model above and say hi.");
+};
+loadModels();
+addMsg("assistant", "Welcome. Pick a model (auto = cloud with local-GPU fallback) and start chatting.");
+</script>
+</body>
+</html>
