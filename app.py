@@ -33,7 +33,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 APP_NAME = "llm-gateway"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.2"
 PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
 # local GPU fallback (llama-ctrl) — the LAST rung of the auto fallback chain
@@ -557,14 +557,21 @@ async def _resolve(model: str | None) -> list[tuple[str, str]]:
 
 
 async def _upstream(method: str, path: str, body: dict, key: str):
-    """Fire one request at one provider. Returns (client, response)."""
+    """Fire one request at one provider. Returns (client, response).
+
+    stream=True: SSE responses are relayed INCREMENTALLY to streaming clients.
+    Without it httpx buffers the ENTIRE upstream body before returning — fast
+    cloud providers masked that, but the local LLM's 90-120s cold wake froze
+    the UI (the ctrl 'warming up...' preamble arrived only after the full
+    response, i.e. never during the wait)."""
     prov = PROVIDERS[key]
     url = f"{prov['base_url']}{path}"
     client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10, read=600, write=60, pool=10)
     )
     try:
-        r = await client.request(method, url, headers=_headers(prov), json=body)
+        req = client.build_request(method, url, headers=_headers(prov), json=body)
+        r = await client.send(req, stream=True)
     except Exception:
         await client.aclose()
         raise
@@ -749,7 +756,12 @@ async def list_models():
             union |= served
     if len(PROVIDERS) >= 2:
         for mid in sorted(union):
-            if sum(1 for key in PROVIDERS if mid in (await _provider_models(key) or set())) >= 2:
+            count = 0
+            for key in PROVIDERS:
+                served = await _provider_models(key)
+                if served and mid in served:
+                    count += 1
+            if count >= 2:
                 ids.append(f"AGNO-{mid}")
     # de-dup preserving order
     seen, out = set(), []
