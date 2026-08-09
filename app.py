@@ -33,7 +33,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 APP_NAME = "llm-gateway"
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
 # local GPU fallback (llama-ctrl) — the LAST rung of the auto fallback chain
@@ -556,14 +556,16 @@ async def _resolve(model: str | None) -> list[tuple[str, str]]:
     )
 
 
-async def _upstream(method: str, path: str, body: dict, key: str):
+async def _upstream(method: str, path: str, body: dict, key: str, stream: bool = False):
     """Fire one request at one provider. Returns (client, response).
 
-    stream=True: SSE responses are relayed INCREMENTALLY to streaming clients.
-    Without it httpx buffers the ENTIRE upstream body before returning — fast
-    cloud providers masked that, but the local LLM's 90-120s cold wake froze
-    the UI (the ctrl 'warming up...' preamble arrived only after the full
-    response, i.e. never during the wait)."""
+    stream=True: SSE relayed INCREMENTALLY (the chat/completions streaming
+    path) — caller consumes via aiter_bytes(); body is NOT pre-read.
+    stream=False (default): httpx reads eagerly, so r.json()/r.content work
+    directly. v1.7.2 set stream=True unconditionally, which 500'd every
+    non-streaming request (httpx.ResponseNotRead on r.json()/r.content) —
+    fixed in v1.7.3 by making it explicit per call site.
+    """
     prov = PROVIDERS[key]
     url = f"{prov['base_url']}{path}"
     client = httpx.AsyncClient(
@@ -571,7 +573,7 @@ async def _upstream(method: str, path: str, body: dict, key: str):
     )
     try:
         req = client.build_request(method, url, headers=_headers(prov), json=body)
-        r = await client.send(req, stream=True)
+        r = await client.send(req, stream=stream)
     except Exception:
         await client.aclose()
         raise
@@ -994,7 +996,7 @@ async def chat_completions(request: Request):
         payload["model"] = upstream
         _ensure_reasoning_echo(payload.get("messages"), _is_thinking_model(upstream))
         try:
-            client, r = await _upstream("POST", "/chat/completions", payload, key)
+            client, r = await _upstream("POST", "/chat/completions", payload, key, stream=True)
         except (httpx.TransportError, httpx.TimeoutException) as e:
             await client.aclose()
             last_err = f"{PROVIDERS[key]['label']} unreachable: {type(e).__name__}"
@@ -1003,6 +1005,10 @@ async def chat_completions(request: Request):
             last_err = f"{PROVIDERS[key]['label']} HTTP {r.status_code}"
             # still report the body of the first failure if it's the only route
             if len(routes) == 1:
+                try:
+                    await r.aread()
+                except Exception:
+                    pass
                 await client.aclose()
                 return Response(r.content, status_code=r.status_code, media_type=r.headers.get("content-type", "application/json"))
             await client.aclose()
