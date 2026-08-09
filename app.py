@@ -10,6 +10,10 @@ providers. Model names are prefixed by provider (case-insensitive):
   auto           -> OCG-<AUTO_MODEL> with fallback to DPSK-<AUTO_MODEL>, then
                     LOCAL-<LOCAL_MODEL> (final fallback)
 
+v1.7.0: chat sessions are persisted server-side (SQLite + cookie), the UI
+shows live provider + local-LLM status, and AGNO-<model> is only advertised
+when >=2 providers actually serve it.
+
 LAN-only service (llm.homelab.internal); never exposed through the tunnel.
 Serves a simple chat UI at /ui (model selection + streaming chat).
 """
@@ -17,16 +21,19 @@ Serves a simple chat UI at /ui (model selection + streaming chat).
 import asyncio
 import json
 import os
+import sqlite3
+import threading
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 APP_NAME = "llm-gateway"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
 # local GPU fallback (llama-ctrl) — the LAST rung of the auto fallback chain
@@ -59,6 +66,98 @@ LIVE_FLUSH_BATCH = int(os.environ.get("LIVE_FLUSH_BATCH", "20"))
 
 _live_queue: asyncio.Queue = asyncio.Queue()
 _live_flusher_task = None
+
+# ---------------- chat session persistence (v1.7.0) ----------------
+# Server-side chat history keyed by a cookie. The UI sends the cookie on every
+# request; a session survives browser close / window loss — the full transcript
+# (plus any in-flight partial reply) is stored and restored on return.
+SESSION_DB = os.environ.get("SESSION_DB", "/data/sessions.db")
+SESSION_COOKIE = "llm_session"
+SESSION_TTL_DAYS = int(os.environ.get("SESSION_TTL_DAYS", "30"))
+
+_sqlite_lock = threading.Lock()
+
+
+def _db() -> sqlite3.Connection:
+    """Thread-safe SQLite connection (per-call, WAL)."""
+    conn = sqlite3.connect(SESSION_DB, timeout=10, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_db():
+    Path(os.path.dirname(SESSION_DB) or ".").mkdir(parents=True, exist_ok=True)
+    with _sqlite_lock, _db() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                messages TEXT NOT NULL,      -- JSON array of {role, content}
+                model TEXT NOT NULL DEFAULT 'auto',
+                updated_at REAL NOT NULL
+            )"""
+        )
+
+
+def _load_session(sid: str) -> tuple[list[dict], str] | None:
+    if not sid:
+        return None
+    try:
+        with _sqlite_lock, _db() as conn:
+            row = conn.execute(
+                "SELECT messages, model FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+        if not row:
+            return None
+        return json.loads(row[0]), row[1]
+    except Exception:
+        return None
+
+
+def _save_session(sid: str, messages: list[dict], model: str):
+    try:
+        with _sqlite_lock, _db() as conn:
+            conn.execute(
+                """INSERT INTO sessions (id, messages, model, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     messages = excluded.messages,
+                     model = excluded.model,
+                     updated_at = excluded.updated_at""",
+                (sid, json.dumps(messages), model, time.time()),
+            )
+    except Exception:
+        pass
+
+
+def _session_id_from(request: Request) -> str:
+    return request.cookies.get(SESSION_COOKIE, "")
+
+
+# ---- live local-LLM status cache (v1.7.0) ----
+# The gateway proxies llama-ctrl's /status for the UI. It's cached briefly so
+# the UI doesn't hammer ctrl (which would wake the server on status polls).
+LOCAL_CTRL_URL = os.environ.get(
+    "LOCAL_CTRL_URL", "http://llama-ctrl.llama.svc.cluster.local"
+).rstrip("/")
+_local_status: dict | None = None
+_local_status_at = 0.0
+_LOCAL_STATUS_TTL = 5.0
+
+
+def _local_status_sync() -> dict | None:
+    """Best-effort snapshot of llama-ctrl /status (None = ctrl unreachable)."""
+    global _local_status, _local_status_at
+    now = time.monotonic()
+    if _local_status is not None and now - _local_status_at < _LOCAL_STATUS_TTL:
+        return _local_status
+    try:
+        r = httpx.get(f"{LOCAL_CTRL_URL}/status", timeout=3)
+        r.raise_for_status()
+        _local_status = r.json()
+    except Exception:
+        _local_status = None
+    _local_status_at = now
+    return _local_status
 
 # provider key -> (label, base_url, api_key)
 PROVIDERS = {
@@ -306,6 +405,7 @@ async def _stats_flusher():
             await asyncio.sleep(STATS_FLUSH_SECONDS)
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+_init_db()
 
 # Simple chat UI (model selection + streaming chat) — served at / and /ui
 _UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
@@ -315,6 +415,61 @@ _UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html")
 @app.get("/ui", include_in_schema=False)
 async def chat_ui():
     return FileResponse(_UI_PATH, media_type="text/html")
+
+
+@app.get("/local/status", include_in_schema=False)
+async def local_status():
+    """Live llama-ctrl status (cached 5s) — drives the UI's LOCAL indicator."""
+    st = _local_status_sync()
+    if st is None:
+        return JSONResponse({"reachable": False, "detail": "ctrl unreachable"})
+    return JSONResponse({"reachable": True, **st})
+
+
+@app.get("/local/providers", include_in_schema=False)
+async def local_providers():
+    """Provider availability for the UI status bar (cached model lists)."""
+    out = {}
+    for key, prov in PROVIDERS.items():
+        served = await _provider_models(key)
+        out[key] = {
+            "label": prov["label"],
+            "reachable": served is not None,
+            "models": sorted(served) if served is not None else [],
+        }
+    return JSONResponse(out)
+
+
+@app.get("/v1/session", include_in_schema=False)
+async def get_session(request: Request):
+    """Get-or-create the chat session. Returns the cookie (Set-Cookie on new),
+    the stored transcript, and the last model. The UI calls this on load."""
+    sid = request.cookies.get(SESSION_COOKIE)
+    if not sid:
+        sid = uuid.uuid4().hex
+        data = {"id": sid, "messages": [], "model": "auto", "new": True}
+        resp = JSONResponse(data)
+        resp.set_cookie(
+            SESSION_COOKIE, sid, max_age=SESSION_TTL_DAYS * 86400,
+            httponly=True, samesite="lax", path="/",
+        )
+        return resp
+    loaded = _load_session(sid)
+    messages, model = (loaded if loaded else ([], "auto"))
+    return JSONResponse({"id": sid, "messages": messages, "model": model, "new": False})
+
+
+@app.post("/v1/session/clear", include_in_schema=False)
+async def clear_session(request: Request):
+    """Wipe the current session's transcript (cookie stays valid)."""
+    sid = _session_id_from(request)
+    if sid:
+        try:
+            with _sqlite_lock, _db() as conn:
+                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+        except Exception:
+            pass
+    return JSONResponse({"ok": True})
 
 _models_cache: dict[str, tuple[float, set[str] | None]] = {}
 
@@ -583,16 +738,19 @@ async def list_models():
             served = {AUTO_MODEL}  # can't verify -> advertise the default only
         for mid in sorted(served):
             ids.append(f"{prov['label']}-{mid}")
-    # AGNO-<model> for the union of everything any provider serves
+    # AGNO-<model> only when >=2 providers actually serve it — a single
+    # provider serving a model already has its own prefix (OCG-/DPSK-/LOCAL-);
+    # advertising AGNO- for it would be redundant AND misleading (it implies a
+    # choice of backends where none exists).
     union: set[str] = set()
     for key in PROVIDERS:
         served = await _provider_models(key)
         if served:
             union |= served
-    if not union:
-        union = {AUTO_MODEL}
-    for mid in sorted(union):
-        ids.append(f"AGNO-{mid}")
+    if len(PROVIDERS) >= 2:
+        for mid in sorted(union):
+            if sum(1 for key in PROVIDERS if mid in (await _provider_models(key) or set())) >= 2:
+                ids.append(f"AGNO-{mid}")
     # de-dup preserving order
     seen, out = set(), []
     for mid in ids:
@@ -784,6 +942,17 @@ async def chat_completions(request: Request):
                 # remember reasoning_content so follow-up tool loops echo it
                 if _is_thinking_model(upstream):
                     _cache_reasoning_echo(content)
+                # persist the conversation server-side (v1.7.0)
+                sid = _session_id_from(request)
+                if sid:
+                    try:
+                        msgs = body.get("messages") or []
+                        reply = ((content or {}).get("choices") or [{}])[0].get("message", {}).get("content") or ""
+                        if reply.strip():
+                            msgs = [*msgs, {"role": "assistant", "content": reply}]
+                        _save_session(sid, msgs, str(body.get("model", "")))
+                    except Exception:
+                        pass
             await client.aclose()
             # record stats (non-streaming; usage comes from the JSON body)
             u = (content or {}).get("usage") or {}
@@ -830,6 +999,7 @@ async def chat_completions(request: Request):
         async def stream(client=client, r=r):
             chunks = []
             t0 = time.time()
+            sid = _session_id_from(request)
             try:
                 async for chunk in r.aiter_bytes():
                     chunks.append(chunk)
@@ -850,6 +1020,18 @@ async def chat_completions(request: Request):
                     # remember reasoning_content from the stream for follow-up loops
                     if _is_thinking_model(upstream):
                         _cache_reasoning_echo_from_sse(b"".join(chunks))
+                # persist the conversation server-side (v1.7.0): whatever was
+                # produced — including a partial reply if the client disconnected
+                # mid-stream — is stored so the UI can restore it on return.
+                if sid:
+                    try:
+                        msgs = body.get("messages") or []
+                        reply = _sse_reply_text(b"".join(chunks))
+                        if reply.strip():
+                            msgs = [*msgs, {"role": "assistant", "content": reply}]
+                        _save_session(sid, msgs, str(body.get("model", "")))
+                    except Exception:
+                        pass
                 # record stats (streaming; usage from the final SSE chunk when present)
                 try:
                     _record_stat({
