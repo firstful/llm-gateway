@@ -110,9 +110,11 @@ async function loadModels() {
     for (const id of ids) {
       const o = document.createElement("option");
       o.value = id;
-      // v1.7.0: show the CLEAN model name (strip provider prefixes). The
-      // prefix is still the value — the display is just human-friendly.
-      o.textContent = id.replace(/^(auto|OCG|DPSK|LOCAL|AGNO)-/i, "");
+      // Show the FULL prefixed id (OCG-/DPSK-/LOCAL-/AGNO-) — the prefix is
+      // the provider and the user wants to see it. (v1.7.0 stripped it for
+      // display; v1.7.4 restores it — bare names made cloud vs local GPU
+      // indistinguishable, and duplicates collided in the list.)
+      o.textContent = id;
       modelSel.appendChild(o);
     }
     $("status").textContent = ids.length + " models";

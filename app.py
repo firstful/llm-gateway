@@ -33,7 +33,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 APP_NAME = "llm-gateway"
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.7.4"
 PORT = int(os.environ.get("PORT", "8080"))
 AUTO_MODEL = os.environ.get("AUTO_MODEL", "deepseek-v4-flash")
 # local GPU fallback (llama-ctrl) — the LAST rung of the auto fallback chain
