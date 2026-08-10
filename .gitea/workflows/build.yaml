@@ -1,0 +1,10 @@
+name: build-image
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    uses: reeds/ci-pipelines/.gitea/workflows/build-csharp.yml@main
+    with:
+      image: reeds/llm-gateway
+    secrets: inherit

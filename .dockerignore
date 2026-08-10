@@ -1,4 +1,3 @@
-__pycache__/
-*.pyc
+bin/
+obj/
 .git/
-.gitignore
