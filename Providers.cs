@@ -32,6 +32,9 @@ public static class Env
     // DPSK leg of the auto chain can serve a DIFFERENT model than OCG (e.g. the
     // cheapest OCG-only model like mimo-v2.5) — DeepSeek may not serve it.
     public static string DpskFallbackModel { get; } = EnvOr("DPSK_FALLBACK_MODEL", "deepseek-v4-flash");
+    // OpenRouter free leg — first in the auto chain (free tier; falls back on
+    // 429 rate limits). openrouter/free routes to whatever free model is up.
+    public static string OrModel { get; } = EnvOr("OR_MODEL", "openrouter/free");
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
@@ -138,6 +141,7 @@ public static class Providers
     {
         var list = new List<Provider>
         {
+            new() { Key = "or", Label = "OR", BaseUrl = Env.EnvOr("OR_BASE_URL", "https://openrouter.ai/api/v1").TrimEnd('/'), ApiKey = Env.EnvOr("OR_API_KEY", "") },
             new() { Key = "ocg", Label = "OCG", BaseUrl = Env.EnvOr("OCG_BASE_URL", "").TrimEnd('/'), ApiKey = Env.EnvOr("OCG_API_KEY", "") },
             new() { Key = "dpsk", Label = "DPSK", BaseUrl = Env.EnvOr("DPSK_BASE_URL", "").TrimEnd('/'), ApiKey = Env.EnvOr("DPSK_API_KEY", "") },
         };
@@ -209,19 +213,26 @@ public static class Providers
             // fallback (if enabled). local serves LOCAL_MODEL, not AUTO_MODEL.
             // DPSK gets DPSK_FALLBACK_MODEL (DeepSeek may not serve the OCG-only
             // AUTO_MODEL — keep a model DeepSeek actually has on the fallback leg).
-            var chain = AgnoOrder.Where(k => k != "local").Select(k => (k, k == "dpsk" ? Env.DpskFallbackModel : Env.AutoModel)).ToList();
-            if (chain.Count == 0) chain = new List<(string, string)> { ("ocg", Env.AutoModel), ("dpsk", Env.DpskFallbackModel) };
+            // OR gets OR_MODEL (openrouter/free — first leg, free tier).
+            var chain = AgnoOrder.Where(k => k != "local").Select(k =>
+                k switch
+                {
+                    "or" => (k, Env.OrModel),
+                    "dpsk" => (k, Env.DpskFallbackModel),
+                    _ => (k, Env.AutoModel),
+                }).ToList();
+            if (chain.Count == 0) chain = new List<(string, string)> { ("or", Env.OrModel), ("ocg", Env.AutoModel), ("dpsk", Env.DpskFallbackModel) };
             if (LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
 
-        foreach (var key in new[] { "ocg", "dpsk", "agno", "local" })
+        foreach (var key in new[] { "or", "ocg", "dpsk", "agno", "local" })
         {
             if (!low.StartsWith(key + "-")) continue;
             var upstream = m[(key.Length + 1)..].Trim();
             if (upstream.Length == 0)
                 throw new ApiError(400, $"model '{m}': missing upstream model after '{key}-'");
-            if (key is "ocg" or "dpsk" or "local")
+            if (key is "or" or "ocg" or "dpsk" or "local")
                 return new List<(string, string)> { (key, upstream) };
             // AGNO: providers that are up AND serving this model, in order
             var agno = new List<(string, string)>();
@@ -238,7 +249,7 @@ public static class Providers
         }
 
         throw new ApiError(404,
-            $"unknown model '{m}'. Use a provider prefix (OCG-/DPSK-/LOCAL-/AGNO-) or 'auto'.");
+            $"unknown model '{m}'. Use a provider prefix (OR-/OCG-/DPSK-/LOCAL-/AGNO-) or 'auto'.");
     }
 
     /// <summary>Fire one request at one provider. stream=true -> SSE relay path.</summary>
