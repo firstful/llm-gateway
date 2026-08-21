@@ -29,6 +29,9 @@ public static class Env
     public const string AppVersion = "2.0.0";
 
     public static string AutoModel { get; } = EnvOr("AUTO_MODEL", "deepseek-v4-flash");
+    // DPSK leg of the auto chain can serve a DIFFERENT model than OCG (e.g. the
+    // cheapest OCG-only model like mimo-v2.5) — DeepSeek may not serve it.
+    public static string DpskFallbackModel { get; } = EnvOr("DPSK_FALLBACK_MODEL", "deepseek-v4-flash");
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
@@ -204,8 +207,10 @@ public static class Providers
         {
             // cloud providers first (AGNO order), then the local GPU as FINAL
             // fallback (if enabled). local serves LOCAL_MODEL, not AUTO_MODEL.
-            var chain = AgnoOrder.Where(k => k != "local").Select(k => (k, Env.AutoModel)).ToList();
-            if (chain.Count == 0) chain = new List<(string, string)> { ("ocg", Env.AutoModel), ("dpsk", Env.AutoModel) };
+            // DPSK gets DPSK_FALLBACK_MODEL (DeepSeek may not serve the OCG-only
+            // AUTO_MODEL — keep a model DeepSeek actually has on the fallback leg).
+            var chain = AgnoOrder.Where(k => k != "local").Select(k => (k, k == "dpsk" ? Env.DpskFallbackModel : Env.AutoModel)).ToList();
+            if (chain.Count == 0) chain = new List<(string, string)> { ("ocg", Env.AutoModel), ("dpsk", Env.DpskFallbackModel) };
             if (LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
