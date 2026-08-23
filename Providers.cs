@@ -11,12 +11,15 @@ namespace LlmGateway;
 /// /v1/responses, aggregating multiple upstream LLM providers. Model names are
 /// prefixed by provider (case-insensitive):
 ///
-///   OCG-&lt;model&gt;    -> opencode-go   (https://opencode.ai/zen/go/v1)
+///   OCZ-&lt;model&gt;    -> opencode zen  (https://opencode.ai/zen/v1) — main API,
+///                     free models live here under their own ids
+///   OCG-&lt;model&gt;    -> opencode-go   (https://opencode.ai/zen/go/v1) — weekly-capped
 ///   DPSK-&lt;model&gt;   -> deepseek      (https://api.deepseek.com/v1)
 ///   LOCAL-&lt;model&gt;  -> local GPU     (llama-ctrl; ONLY when LOCAL_ENABLED=1)
 ///   AGNO-&lt;model&gt;   -> any provider that is available AND serving &lt;model&gt;
-///   auto           -> OCG-&lt;AUTO_MODEL&gt; with fallback to DPSK-&lt;AUTO_MODEL&gt;,
-///                     then LOCAL-&lt;LOCAL_MODEL&gt; (final fallback, if enabled)
+///   auto           -> AGNO order legs with per-provider model resolution
+///                     (ResolveAutoAsync), then LOCAL-&lt;LOCAL_MODEL&gt;
+///                     (final fallback, if enabled)
 ///
 /// Chat sessions persist server-side (SQLite + cookie), the UI shows live
 /// provider + local-LLM status, and AGNO-&lt;model&gt; is only advertised when >=2
@@ -26,7 +29,7 @@ namespace LlmGateway;
 public static class Env
 {
     public const string AppName = "llm-gateway";
-    public const string AppVersion = "2.0.0";
+    public const string AppVersion = "2.1.0";
 
     public static string AutoModel { get; } = EnvOr("AUTO_MODEL", "deepseek-v4-flash");
     // DPSK leg of the auto chain can serve a DIFFERENT model than OCG (e.g. the
@@ -131,6 +134,37 @@ public static class Providers
 
     static readonly ConcurrentDictionary<string, (DateTime At, HashSet<string>? Ids)> ModelsCache = new();
 
+    // OCZ (opencode.ai/zen/v1) serves some models under ids that differ from
+    // OCG's /go endpoint. Known renames that don't fit the -free suffix rule.
+    static readonly Dictionary<string, string> OczAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["ox-alpha-free"] = "x-preview-f-free",
+    };
+
+    /// <summary>
+    /// Automatic model resolution for auto/AGNO chain legs: map the desired
+    /// model name to an id the provider actually serves, or null when a
+    /// verifiable /models listing shows no match (the leg is skipped so the
+    /// chain falls through instead of dying on an upstream 404, which is NOT
+    /// in FallbackStatus). Only OCZ resolves today — zen's free-model ids
+    /// differ from the /go endpoint's (exact -> alias -> +free -> -free).
+    /// </summary>
+    public static async Task<string?> ResolveAutoAsync(string key, string want)
+    {
+        if (key != "ocz") return want;
+        var ids = await ProviderModelsAsync(key);
+        if (ids is null || ids.Count == 0)
+        {
+            // can't verify — best static guess (upstream errors fall through)
+            return OczAliases.TryGetValue(want, out var blind) ? blind : want;
+        }
+        if (ids.Contains(want)) return want;
+        if (OczAliases.TryGetValue(want, out var alias) && ids.Contains(alias)) return alias;
+        if (ids.Contains(want + "-free")) return want + "-free";
+        if (want.EndsWith("-free") && ids.Contains(want[..^5])) return want[..^5];
+        return null; // verifiably not served -> skip this leg
+    }
+
     // DeepSeek thinking-mode echo cache: keyed by tool_call id, capped.
     static readonly object EchoLock = new();
     static readonly Dictionary<string, string> ReasoningEcho = new();
@@ -142,6 +176,9 @@ public static class Providers
         var list = new List<Provider>
         {
             new() { Key = "or", Label = "OR", BaseUrl = Env.EnvOr("OR_BASE_URL", "https://openrouter.ai/api/v1").TrimEnd('/'), ApiKey = Env.EnvOr("OR_API_KEY", "") },
+            new() { Key = "ocz", Label = "OCZ", BaseUrl = Env.EnvOr("OCZ_BASE_URL", "https://opencode.ai/zen/v1").TrimEnd('/'),
+                // same OpenCode workspace key serves both zen endpoints — default to the OCG key
+                ApiKey = Env.EnvOr("OCZ_API_KEY", Env.EnvOr("OCG_API_KEY", "")) },
             new() { Key = "ocg", Label = "OCG", BaseUrl = Env.EnvOr("OCG_BASE_URL", "").TrimEnd('/'), ApiKey = Env.EnvOr("OCG_API_KEY", "") },
             new() { Key = "dpsk", Label = "DPSK", BaseUrl = Env.EnvOr("DPSK_BASE_URL", "").TrimEnd('/'), ApiKey = Env.EnvOr("DPSK_API_KEY", "") },
         };
@@ -214,25 +251,34 @@ public static class Providers
             // DPSK gets DPSK_FALLBACK_MODEL (DeepSeek may not serve the OCG-only
             // AUTO_MODEL — keep a model DeepSeek actually has on the fallback leg).
             // OR gets OR_MODEL (openrouter/free — first leg, free tier).
-            var chain = AgnoOrder.Where(k => k != "local").Select(k =>
-                k switch
+            // Each leg goes through ResolveAutoAsync: OCZ's ids differ from OCG's
+            // (AUTO_MODEL ox-alpha-free -> x-preview-f-free), and a leg whose
+            // provider verifiably doesn't serve its model is skipped entirely.
+            var chain = new List<(string Key, string Upstream)>();
+            foreach (var k in AgnoOrder.Where(k => k != "local"))
+            {
+                var want = k switch
                 {
-                    "or" => (k, Env.OrModel),
-                    "dpsk" => (k, Env.DpskFallbackModel),
-                    _ => (k, Env.AutoModel),
-                }).ToList();
-            if (chain.Count == 0) chain = new List<(string, string)> { ("or", Env.OrModel), ("ocg", Env.AutoModel), ("dpsk", Env.DpskFallbackModel) };
+                    "or" => Env.OrModel,
+                    "dpsk" => Env.DpskFallbackModel,
+                    _ => Env.AutoModel,
+                };
+                var up = await ResolveAutoAsync(k, want);
+                if (up is not null) chain.Add((k, up));
+            }
+            if (chain.Count == 0)
+                chain = new List<(string, string)> { ("or", Env.OrModel), ("ocz", Env.AutoModel), ("ocg", Env.AutoModel), ("dpsk", Env.DpskFallbackModel) };
             if (LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
 
-        foreach (var key in new[] { "or", "ocg", "dpsk", "agno", "local" })
+        foreach (var key in new[] { "or", "ocz", "ocg", "dpsk", "agno", "local" })
         {
             if (!low.StartsWith(key + "-")) continue;
             var upstream = m[(key.Length + 1)..].Trim();
             if (upstream.Length == 0)
                 throw new ApiError(400, $"model '{m}': missing upstream model after '{key}-'");
-            if (key is "or" or "ocg" or "dpsk" or "local")
+            if (key is "or" or "ocz" or "ocg" or "dpsk" or "local")
                 return new List<(string, string)> { (key, upstream) };
             // AGNO: providers that are up AND serving this model, in order
             var agno = new List<(string, string)>();
@@ -241,7 +287,10 @@ public static class Providers
                 var ids = await ProviderModelsAsync(pk);
                 if (ids is null) continue; // can't verify availability -> skip
                 if (ids.Contains(upstream) || upstream == Env.AutoModel)
-                    agno.Add((pk, upstream));
+                {
+                    var up = await ResolveAutoAsync(pk, upstream);
+                    if (up is not null) agno.Add((pk, up));
+                }
             }
             if (agno.Count == 0)
                 throw new ApiError(404, $"AGNO: no provider available and serving '{upstream}'");
@@ -249,7 +298,7 @@ public static class Providers
         }
 
         throw new ApiError(404,
-            $"unknown model '{m}'. Use a provider prefix (OR-/OCG-/DPSK-/LOCAL-/AGNO-) or 'auto'.");
+            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/DPSK-/LOCAL-/AGNO-) or 'auto'.");
     }
 
     /// <summary>Fire one request at one provider. stream=true -> SSE relay path.</summary>
