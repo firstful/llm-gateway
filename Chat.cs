@@ -60,15 +60,16 @@ public static class Chat
         return null;
     }
 
-    static Stats.Usage UsageFrom(JsonNode? content)
+    static (Stats.Usage U, int Cached) UsageFrom(JsonNode? content)
     {
         var u = content?["usage"];
-        if (u is null) return new Stats.Usage(0, 0, 0);
+        if (u is null) return (new Stats.Usage(0, 0, 0), 0);
         var reasoning = u["completion_tokens_details"]?["reasoning_tokens"]?.GetValue<int>() ?? 0;
-        return new Stats.Usage(
+        var cached = u["prompt_tokens_details"]?["cached_tokens"]?.GetValue<int>() ?? 0;
+        return (new Stats.Usage(
             u["prompt_tokens"]?.GetValue<int>() ?? 0,
             u["completion_tokens"]?.GetValue<int>() ?? 0,
-            reasoning);
+            reasoning), cached);
     }
 
     /// <summary>Safe access to choices[0]: the final SSE chunk is often
@@ -100,7 +101,7 @@ public static class Chat
     }
 
     /// <summary>Extract usage from the final SSE chunk if the upstream includes it.</summary>
-    static Stats.Usage SseUsage(byte[] raw)
+    static (Stats.Usage U, int Cached) SseUsage(byte[] raw)
     {
         foreach (var line in Encoding.UTF8.GetString(raw).Split('\n'))
         {
@@ -114,13 +115,14 @@ public static class Chat
             if (obj["usage"] is JsonObject u)
             {
                 var reasoning = u["completion_tokens_details"]?["reasoning_tokens"]?.GetValue<int>() ?? 0;
-                return new Stats.Usage(
+                var cached = u["prompt_tokens_details"]?["cached_tokens"]?.GetValue<int>() ?? 0;
+                return (new Stats.Usage(
                     u["prompt_tokens"]?.GetValue<int>() ?? 0,
                     u["completion_tokens"]?.GetValue<int>() ?? 0,
-                    reasoning);
+                    reasoning), cached);
             }
         }
-        return new Stats.Usage(0, 0, 0);
+        return (new Stats.Usage(0, 0, 0), 0);
     }
 
     static void RecordStat(HttpContext ctx, string endpoint, bool stream, int status, long latencyMs,
@@ -130,6 +132,16 @@ public static class Chat
         Stats.Record(new Stats.Rec(
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(), consumer, endpoint, stream,
             status, latencyMs, new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), usage));
+    }
+
+    static async Task<string> ErrorSnippetAsync(HttpResponseMessage resp)
+    {
+        try
+        {
+            var s = await resp.Content.ReadAsStringAsync();
+            return s.Length <= 400 ? s : s[..400];
+        }
+        catch { return ""; }
     }
 
     // ---------------- /v1/chat/completions ----------------
@@ -157,6 +169,8 @@ public static class Chat
 
         if (!wantStream)
         {
+            var nsT00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var nsAttempts = new List<ReqLog.Attempt>();
             string? lastErr = null;
             foreach (var (key, upstream) in routes)
             {
@@ -169,6 +183,9 @@ public static class Chat
                 catch (Exception e)
                 {
                     lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
+                    nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                        "unreachable", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                        $"{e.GetType().Name}: {e.Message}"));
                     continue;
                 }
                 using (resp)
@@ -176,7 +193,10 @@ public static class Chat
                     var status = (int)resp.StatusCode;
                     if (Providers.FallbackStatus.Contains(status) && routes.Count > 1)
                     {
+                        var detail = await ErrorSnippetAsync(resp);
                         lastErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
+                        nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                            "fallback-status", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0, detail));
                         continue;
                     }
                     var raw = await resp.Content.ReadAsByteArrayAsync();
@@ -190,8 +210,20 @@ public static class Chat
                         if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEcho(content);
                         SaveSessionFrom(ctx, body["messages"] as JsonArray, model ?? "", reply);
                     }
+                    else
+                    {
+                        nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                            "upstream-error", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                            Encoding.UTF8.GetString(raw)[..Math.Min(400, raw.Length)]));
+                    }
                     var latency = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0;
-                    RecordStat(ctx, "chat", false, status, latency, rag, UsageFrom(content));
+                    var (u, cached) = UsageFrom(content);
+                    RecordStat(ctx, "chat", false, status, latency, rag, u);
+                    nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                        "ok", status, latency, null));
+                    ReqLog.Write(ctx, "chat", model, false,
+                        status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - nsT00, nsAttempts,
+                        new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), u, cached, null);
                     if (content is not null)
                     {
                         ctx.Response.StatusCode = status;
@@ -205,10 +237,16 @@ public static class Chat
                     return;
                 }
             }
+            ReqLog.Write(ctx, "chat", model, false,
+                502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - nsT00, nsAttempts,
+                new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
+                $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
             throw new ApiError(502, $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
         }
 
         // streaming: pick the first provider that responds 2xx, stream its SSE
+        var t00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var attempts = new List<ReqLog.Attempt>();
         string? streamErr = null;
         foreach (var (key, upstream) in routes)
         {
@@ -216,10 +254,14 @@ public static class Chat
             payload["model"] = upstream;
             Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
             HttpResponseMessage resp;
+            var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, true); }
             catch (Exception e)
             {
                 streamErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
+                attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                    "unreachable", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                    $"{e.GetType().Name}: {e.Message}"));
                 continue;
             }
             var status = (int)resp.StatusCode;
@@ -230,11 +272,20 @@ public static class Chat
                 {
                     var raw = await resp.Content.ReadAsByteArrayAsync();
                     resp.Dispose();
+                    attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                        "upstream-error", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                        Encoding.UTF8.GetString(raw)[..Math.Min(400, raw.Length)]));
+                    ReqLog.Write(ctx, "chat", model, true,
+                        status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+                        new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, null);
                     ctx.Response.StatusCode = status;
                     ctx.Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
                     await ctx.Response.Body.WriteAsync(raw);
                     return;
                 }
+                attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                    "fallback-status", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                    await ErrorSnippetAsync(resp)));
                 resp.Dispose();
                 continue;
             }
@@ -243,7 +294,6 @@ public static class Chat
             ctx.Response.StatusCode = 200;
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers["Cache-Control"] = "no-cache";
-            var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var sid = SessionId(ctx);
             var chunks = new MemoryStream();
             try
@@ -276,11 +326,21 @@ public static class Chat
                     }
                 }
                 var latency = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0;
-                RecordStat(ctx, "chat", true, status, latency, rag, SseUsage(raw));
+                var (u, cached) = SseUsage(raw);
+                RecordStat(ctx, "chat", true, status, latency, rag, u);
+                attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                    "ok", status, latency, null));
+                ReqLog.Write(ctx, "chat", model, true,
+                    status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+                    new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), u, cached, null);
                 resp.Dispose();
             }
             return;
         }
+        ReqLog.Write(ctx, "chat", model, true,
+            502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+            new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
+            $"all providers failed for model '{model}': {streamErr ?? "unknown"}");
         throw new ApiError(502, $"all providers failed for model '{model}': {streamErr ?? "unknown"}");
     }
 
@@ -473,6 +533,8 @@ public static class Chat
             throw new ApiError(501, "streaming /v1/responses is not supported yet; use stream:false or /v1/chat/completions");
 
         var routes = await Providers.ResolveAsync(model);
+        var t00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var attempts = new List<ReqLog.Attempt>();
         string? lastErr = null;
         foreach (var (key, upstream) in routes)
         {
@@ -485,6 +547,9 @@ public static class Chat
             catch (Exception e)
             {
                 lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
+                attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                    "unreachable", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                    $"{e.GetType().Name}: {e.Message}"));
                 continue;
             }
             using (resp)
@@ -492,7 +557,10 @@ public static class Chat
                 var status = (int)resp.StatusCode;
                 if (Providers.FallbackStatus.Contains(status) && routes.Count > 1)
                 {
+                    var detail = await ErrorSnippetAsync(resp);
                     lastErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
+                    attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                        "fallback-status", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0, detail));
                     continue;
                 }
                 var raw = await resp.Content.ReadAsByteArrayAsync();
@@ -506,22 +574,41 @@ public static class Chat
                     TeeTurn(ctx, chatPayload["messages"] as JsonArray, reply);
                     if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEcho(chat);
                 }
+                else
+                {
+                    attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                        "upstream-error", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                        Encoding.UTF8.GetString(raw)[..Math.Min(400, raw.Length)]));
+                }
                 var latency = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0;
-                RecordStat(ctx, "responses", false, status, latency, rag, UsageFrom(chat));
+                var (u, cached) = UsageFrom(chat);
+                RecordStat(ctx, "responses", false, status, latency, rag, u);
+                attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
+                    "ok", status, latency, null));
 
                 if (status >= 400)
                 {
+                    ReqLog.Write(ctx, "responses", model, false,
+                        status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+                        new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), u, cached, null);
                     ctx.Response.StatusCode = status;
                     ctx.Response.ContentType = "application/json";
                     await ctx.Response.WriteAsync(chat!.ToJsonString());
                     return;
                 }
+                ReqLog.Write(ctx, "responses", model, false,
+                    status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+                    new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), u, cached, null);
                 ctx.Response.StatusCode = 200;
                 ctx.Response.ContentType = "application/json";
                 await ctx.Response.WriteAsync(ChatToResponse(chat, model).ToJsonString());
                 return;
             }
         }
+        ReqLog.Write(ctx, "responses", model, false,
+            502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+            new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
+            $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
         throw new ApiError(502, $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
     }
 }

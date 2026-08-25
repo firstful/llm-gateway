@@ -68,6 +68,13 @@ public static class Env
 
     // Request statistics (rolling + telemetry) — v1.6/2026-08-07.
     public static int StatsWindow { get; } = IntOr("STATS_WINDOW", 5000);
+
+    // Rolling JSON-lines request log (v2.2.0) — lives on the /data PVC so it
+    // survives restarts. Each file caps at REQ_LOG_MAX_MB, oldest rolled off
+    // past REQ_LOG_KEEP_FILES. Fail-open: logging must never break a request.
+    public static string ReqLogDir { get; } = EnvOr("REQ_LOG_DIR", "/data/logs");
+    public static int ReqLogMaxMb { get; } = IntOr("REQ_LOG_MAX_MB", 100);
+    public static int ReqLogKeepFiles { get; } = IntOr("REQ_LOG_KEEP_FILES", 10);
     public static int StatsFlushSeconds { get; } = IntOr("STATS_FLUSH_SECONDS", 30);
     public static string TelemetryUrl { get; } = EnvOr("TELEMETRY_URL", "").TrimEnd('/');
     public static int TelemetryMaxBytes { get; } = IntOr("TELEMETRY_MAX_BYTES", 3800);
