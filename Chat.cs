@@ -295,6 +295,7 @@ public static class Chat
         var t00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var attempts = new List<ReqLog.Attempt>();
         string? streamErr = null;
+    streamRetry:
         foreach (var (key, upstream) in routes)
         {
             var payload = (JsonObject)body.DeepClone();
@@ -384,11 +385,49 @@ public static class Chat
             }
             return;
         }
+        // All providers failed. Do NOT end the turn — keep the SSE stream open,
+        // emitting keep-alive comments until a provider comes back (or the client
+        // leaves / the cap is hit), then retry the chain from the top.
+        if (!ctx.RequestAborted.IsCancellationRequested)
+        {
+            var waitStart = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var capMs = Env.RecoveryMaxWaitSeconds * 1000L;
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            while (true)
+            {
+                await ctx.Response.WriteAsync($": keep-alive {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}\n\n");
+                await ctx.Response.Body.FlushAsync();
+                try { await Task.Delay(TimeSpan.FromSeconds(Env.RecoveryKeepAliveSeconds), ctx.RequestAborted); }
+                catch (OperationCanceledException) { return; } // client went away
+
+                var recovered = new List<(string Key, string Upstream)>();
+                foreach (var (k, up) in routes)
+                    if (await Providers.ProbeAsync(k) is { Reachable: true } probe)
+                        recovered.Add((k, up));
+                if (recovered.Count > 0)
+                {
+                    routes = recovered;
+                    attempts = new List<ReqLog.Attempt>();
+                    goto streamRetry;
+                }
+                if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - waitStart > capMs)
+                    break;
+            }
+            var gaveup = SummarizeFailures(model ?? "auto", attempts);
+            ReqLog.Write(ctx, "chat", model, true,
+                502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+                new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, gaveup);
+            await ctx.Response.WriteAsync($"data: {{\"error\":{{\"message\":{JsonSerializer.Serialize(gaveup)}}}}}\n\n");
+            await ctx.Response.WriteAsync("data: [DONE]\n\n");
+            await ctx.Response.Body.FlushAsync();
+            return;
+        }
         ReqLog.Write(ctx, "chat", model, true,
             502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
             new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
             SummarizeFailures(model ?? "auto", attempts));
-        throw new ApiError(502, SummarizeFailures(model ?? "auto", attempts));
     }
 
     // ---------------- /v1/responses (OpenAI Responses API) ----------------

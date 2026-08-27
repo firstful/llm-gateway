@@ -79,6 +79,8 @@ public static class Env
     public static int StatsFlushSeconds { get; } = IntOr("STATS_FLUSH_SECONDS", 30);
     public static string TelemetryUrl { get; } = EnvOr("TELEMETRY_URL", "").TrimEnd('/');
     public static int TelemetryMaxBytes { get; } = IntOr("TELEMETRY_MAX_BYTES", 3800);
+    public static int RecoveryKeepAliveSeconds { get; } = IntOr("RECOVERY_KEEPALIVE_SECONDS", 10);
+    public static int RecoveryMaxWaitSeconds { get; } = IntOr("RECOVERY_MAX_WAIT_SECONDS", 600);
 
     public const string RagPrefix =
         "The following is authoritative context from the homelab operator's docs and " +
