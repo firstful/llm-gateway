@@ -173,9 +173,22 @@ public static class Chat
                 : $"HTTP {a.Status} {ShortReason(a.Detail)}".Trim();
             parts.Add($"[{i + 1}] {a.Provider}: {reason}");
         }
-        return $"all providers failed for model '{model}': {string.Join("; ", parts)}. " +
-               "No fallback served this request — rate limits are time-based (retry in a bit); " +
-               "if it keeps failing check provider balances.";
+        var msg = $"all providers failed for model '{model}': {string.Join("; ", parts)}.";
+
+        var allRateLimited = attempts.Count > 0 && attempts.All(a =>
+            a.Status == 429 || (a.Detail?.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ?? false));
+        var balanceShort = attempts.Any(a => (a.Detail?.Contains("insufficient balance", StringComparison.OrdinalIgnoreCase) ?? false)
+            || (a.Detail?.Contains("insufficient_quota", StringComparison.OrdinalIgnoreCase) ?? false));
+
+        if (allRateLimited)
+            msg += " Every provider is quota-limited right now — no free tier is available at this moment. " +
+                   "Stop and retry after a reset window (usually the next hour/day); it is not a transient glitch.";
+        else if (balanceShort)
+            msg += " At least one provider needs a balance top-up — consider adding a small credit balance " +
+                   "to unlock its free tier again (e.g. OpenRouter: even $10 unlocks 1000 free-model requests/day).";
+        else
+            msg += " No fallback served this request — rate limits are time-based, so retry in a bit.";
+        return msg;
     }
 
     // ---------------- /v1/chat/completions ----------------
