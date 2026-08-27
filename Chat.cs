@@ -144,6 +144,40 @@ public static class Chat
         catch { return ""; }
     }
 
+    /// <summary>Short human reason for a failed provider attempt (from its error body).</summary>
+    static string ShortReason(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        try
+        {
+            var par = JsonNode.Parse(raw) as JsonObject;
+            var em = par?["error"]?["message"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(em))
+                return em.Length <= 90 ? em : em[..90];
+        }
+        catch { /* fall back to raw snippet */ }
+        var s = raw!.Replace('\n', ' ').Trim();
+        return s.Length <= 90 ? s : s[..90];
+    }
+
+    /// <summary>Clear aggregated "everything failed" message: one line per provider.</summary>
+    static string SummarizeFailures(string model, IReadOnlyList<ReqLog.Attempt> attempts)
+    {
+        if (attempts.Count == 0) return $"all providers failed for model '{model}'";
+        var parts = new List<string>();
+        for (var i = 0; i < attempts.Count; i++)
+        {
+            var a = attempts[i];
+            var reason = a.Outcome == "unreachable"
+                ? $"unreachable ({ShortReason(a.Detail)})"
+                : $"HTTP {a.Status} {ShortReason(a.Detail)}".Trim();
+            parts.Add($"[{i + 1}] {a.Provider}: {reason}");
+        }
+        return $"all providers failed for model '{model}': {string.Join("; ", parts)}. " +
+               "No fallback served this request — rate limits are time-based (retry in a bit); " +
+               "if it keeps failing check provider balances.";
+    }
+
     // ---------------- /v1/chat/completions ----------------
 
     public static async Task ChatCompletions(HttpContext ctx)
@@ -240,8 +274,8 @@ public static class Chat
             ReqLog.Write(ctx, "chat", model, false,
                 502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - nsT00, nsAttempts,
                 new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-                $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
-            throw new ApiError(502, $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
+                SummarizeFailures(model ?? "auto", nsAttempts));
+            throw new ApiError(502, SummarizeFailures(model ?? "auto", nsAttempts));
         }
 
         // streaming: pick the first provider that responds 2xx, stream its SSE
@@ -340,8 +374,8 @@ public static class Chat
         ReqLog.Write(ctx, "chat", model, true,
             502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
             new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-            $"all providers failed for model '{model}': {streamErr ?? "unknown"}");
-        throw new ApiError(502, $"all providers failed for model '{model}': {streamErr ?? "unknown"}");
+            SummarizeFailures(model ?? "auto", attempts));
+        throw new ApiError(502, SummarizeFailures(model ?? "auto", attempts));
     }
 
     // ---------------- /v1/responses (OpenAI Responses API) ----------------
@@ -608,7 +642,7 @@ public static class Chat
         ReqLog.Write(ctx, "responses", model, false,
             502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
             new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-            $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
-        throw new ApiError(502, $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
+            SummarizeFailures(model, attempts));
+        throw new ApiError(502, SummarizeFailures(model, attempts));
     }
 }
