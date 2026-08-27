@@ -326,8 +326,11 @@ public static class Chat
                     ReqLog.Write(ctx, "chat", model, true,
                         status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
                         new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, null);
-                    ctx.Response.StatusCode = status;
-                    ctx.Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
+                    if (!ctx.Response.HasStarted)
+                    {
+                        ctx.Response.StatusCode = status;
+                        ctx.Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
+                    }
                     await ctx.Response.Body.WriteAsync(raw);
                     return;
                 }
@@ -339,9 +342,12 @@ public static class Chat
             }
 
             // relay SSE incrementally; accumulate for post-processing
-            ctx.Response.StatusCode = 200;
-            ctx.Response.ContentType = "text/event-stream";
-            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            if (!ctx.Response.HasStarted)
+            {
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.Headers["Cache-Control"] = "no-cache";
+            }
             var sid = SessionId(ctx);
             var chunks = new MemoryStream();
             try
