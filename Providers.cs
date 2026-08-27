@@ -137,7 +137,7 @@ public static class Providers
         .Where(k => All.Any(p => p.Key == k)).ToList();
 
     // fallback on these upstream outcomes for auto/AGNO chains
-    public static readonly HashSet<int> FallbackStatus = new() { 401, 403, 408, 429, 500, 502, 503, 504 };
+    public static readonly HashSet<int> FallbackStatus = new() { 401, 402, 403, 408, 429, 500, 502, 503, 504 };
 
     static readonly ConcurrentDictionary<string, (DateTime At, HashSet<string>? Ids)> ModelsCache = new();
 
