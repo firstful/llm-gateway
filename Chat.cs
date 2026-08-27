@@ -397,8 +397,15 @@ public static class Chat
             ctx.Response.Headers["Cache-Control"] = "no-cache";
             while (true)
             {
-                await ctx.Response.WriteAsync($": keep-alive {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}\n\n");
-                await ctx.Response.Body.FlushAsync();
+                try
+                {
+                    await ctx.Response.WriteAsync($": keep-alive {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}\n\n");
+                    await ctx.Response.Body.FlushAsync();
+                }
+                catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException)
+                {
+                    return; // client went away mid-keepalive
+                }
                 try { await Task.Delay(TimeSpan.FromSeconds(Env.RecoveryKeepAliveSeconds), ctx.RequestAborted); }
                 catch (OperationCanceledException) { return; } // client went away
 
@@ -419,9 +426,16 @@ public static class Chat
             ReqLog.Write(ctx, "chat", model, true,
                 502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
                 new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, gaveup);
-            await ctx.Response.WriteAsync($"data: {{\"error\":{{\"message\":{JsonSerializer.Serialize(gaveup)}}}}}\n\n");
-            await ctx.Response.WriteAsync("data: [DONE]\n\n");
-            await ctx.Response.Body.FlushAsync();
+            try
+            {
+                await ctx.Response.WriteAsync($"data: {{\"error\":{{\"message\":{JsonSerializer.Serialize(gaveup)}}}}}\n\n");
+                await ctx.Response.WriteAsync("data: [DONE]\n\n");
+                await ctx.Response.Body.FlushAsync();
+            }
+            catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException)
+            {
+                // client already gone; nothing to say
+            }
             return;
         }
         ReqLog.Write(ctx, "chat", model, true,
