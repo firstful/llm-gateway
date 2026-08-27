@@ -73,7 +73,7 @@ public static class ReqLog
         catch { /* fail-open */ }
     }
 
-    static string? Trunc(string? s)
+    public static string? Trunc(string? s)
         => string.IsNullOrEmpty(s) ? s : s.Length <= 400 ? s : s[..400];
 
     static void Append(string line)
@@ -119,5 +119,65 @@ public static class ReqLog
             if (all[i] == curPath && all.Count == 1) break;
             try { File.Delete(all[i]); } catch { break; }
         }
+    }
+
+    /// <summary>Per-provider request health over the last window (for the status UI).</summary>
+    public sealed record ProvStat(int Ok, int Fail, string? LastError, string? LastUpstream);
+    public sealed record RecentStats(int Requests, int Errors, Dictionary<string, ProvStat> Providers);
+
+    public static RecentStats Recent(int windowSeconds, int maxLines = 4000)
+    {
+        var prov = new Dictionary<string, ProvStat>();
+        int requests = 0, errors = 0;
+        try
+        {
+            List<string> lines;
+            lock (Lock)
+            {
+                lines = new List<string>();
+                foreach (var f in Directory.EnumerateFiles(Dir, $"{Prefix}*.jsonl").OrderBy(f => f))
+                {
+                    try { lines.AddRange(File.ReadLines(f)); }
+                    catch { }
+                }
+                if (lines.Count > maxLines) lines = lines.Skip(lines.Count - maxLines).ToList();
+            }
+            var cutoff = DateTimeOffset.UtcNow.AddSeconds(-windowSeconds);
+            for (var i = lines.Count - 1; i >= 0; i--)
+            {
+                JsonObject? o;
+                try { o = JsonNode.Parse(lines[i]) as JsonObject; } catch { continue; }
+                if (o is null) continue;
+                var ts = o["ts"]?.GetValue<string>();
+                if (string.IsNullOrEmpty(ts)) continue;
+                if (!DateTimeOffset.TryParse(ts, out var at) || at < cutoff) continue;
+
+                requests++;
+                if ((o["status"]?.GetValue<int>() ?? 0) >= 400) errors++;
+                if (o["attempts"] is JsonArray arr)
+                {
+                    foreach (var node in arr)
+                    {
+                        if (node is not JsonObject a) continue;
+                        var pk = a["provider"]?.GetValue<string>() ?? "?";
+                        var outcome = a["outcome"]?.GetValue<string>() ?? "?";
+                        var upstream = a["upstream"]?.GetValue<string>();
+                        var detail = a["detail"]?.GetValue<string>();
+                        if (!prov.TryGetValue(pk, out var st))
+                        {
+                            st = new ProvStat(0, 0, null, null);
+                            prov[pk] = st;
+                        }
+                        var ok = outcome == "ok" ? st.Ok + 1 : st.Ok;
+                        var fail = outcome == "ok" ? st.Fail : st.Fail + 1;
+                        prov[pk] = new ProvStat(ok, fail,
+                            string.IsNullOrEmpty(detail) ? st.LastError : detail,
+                            upstream ?? st.LastUpstream);
+                    }
+                }
+            }
+        }
+        catch { /* fail-open */ }
+        return new RecentStats(requests, errors, prov);
     }
 }

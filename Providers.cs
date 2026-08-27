@@ -75,6 +75,7 @@ public static class Env
     public static string ReqLogDir { get; } = EnvOr("REQ_LOG_DIR", "/data/logs");
     public static int ReqLogMaxMb { get; } = IntOr("REQ_LOG_MAX_MB", 100);
     public static int ReqLogKeepFiles { get; } = IntOr("REQ_LOG_KEEP_FILES", 10);
+    public static int ReqLogWindowSeconds { get; } = IntOr("REQ_LOG_WINDOW_SECONDS", 600);
     public static int StatsFlushSeconds { get; } = IntOr("STATS_FLUSH_SECONDS", 30);
     public static string TelemetryUrl { get; } = EnvOr("TELEMETRY_URL", "").TrimEnd('/');
     public static int TelemetryMaxBytes { get; } = IntOr("TELEMETRY_MAX_BYTES", 3800);
@@ -241,6 +242,53 @@ public static class Providers
         }
         ModelsCache[key] = (now, ids);
         return ids;
+    }
+
+    /// <summary>Recent reachability + latency probe per provider (30s-cached — for the status UI).</summary>
+    public sealed record ProvProbe(bool Reachable, long LatencyMs, int ModelCount, DateTime At);
+
+    static readonly ConcurrentDictionary<string, ProvProbe> ProbeCache = new();
+
+    public static async Task<ProvProbe?> ProbeAsync(string key)
+    {
+        var now = DateTime.UtcNow;
+        if (ProbeCache.TryGetValue(key, out var hit) && now - hit.At < TimeSpan.FromSeconds(30))
+            return hit;
+
+        var p = ByKey(key);
+        ProvProbe? probe = null;
+        if (p is not null)
+        {
+            var at = DateTime.UtcNow;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, $"{p.BaseUrl}/models");
+                if (!string.IsNullOrEmpty(p.ApiKey)) req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {p.ApiKey}");
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                using var resp = await p.Client.SendAsync(req, cts.Token);
+                sw.Stop();
+                if (resp.IsSuccessStatusCode)
+                {
+                    var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(cts.Token));
+                    var n = 0;
+                    if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+                        n = data.GetArrayLength();
+                    probe = new ProvProbe(true, sw.ElapsedMilliseconds, n, at);
+                }
+                else
+                {
+                    probe = new ProvProbe(false, sw.ElapsedMilliseconds, 0, at);
+                }
+            }
+            catch
+            {
+                sw.Stop();
+                probe = new ProvProbe(false, sw.ElapsedMilliseconds, 0, at);
+            }
+            ProbeCache[key] = probe;
+        }
+        return probe;
     }
 
     /// <summary>Ordered (provider_key, upstream_model) chain for a model name.</summary>

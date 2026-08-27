@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llm-gateway status</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.45 system-ui, sans-serif;
+    background: #0d1117; color: #e6edf3;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; padding: 14px 18px;
+    border-bottom: 1px solid #21262d; position: sticky; top: 0;
+    background: #0d1117; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sub { color: #8b93a3; font-size: 12px; }
+  header .clk { margin-left: auto; color: #8b93a3; font-size: 12px; font-variant-numeric: tabular-nums; }
+  main { padding: 16px 18px; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .card {
+    background: #161b22; border: 1px solid #21262d; border-radius: 10px;
+    padding: 14px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .card h2 { margin: 0; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: #4ade80; box-shadow: 0 0 6px #4ade8066; }
+  .dot.warn { background: #fbbf24; }
+  .dot.bad { background: #f87171; box-shadow: 0 0 6px #f8717166; }
+  .meta { color: #8b93a3; font-size: 12px; }
+  .k { color: #8b93a3; }
+  .val { color: #e6edf3; }
+  .models { font-size: 12px; color: #8b93a3; max-height: 96px; overflow: auto; line-height: 1.5; }
+  .models mark { background: none; color: #a5b4cf; }
+  .rec { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .bar { position: relative; flex: 1; height: 10px; background: #0d1117; border-radius: 5px; overflow: hidden; }
+  .bar i { position: absolute; top: 0; bottom: 0; left: 0; background: #2ea043; }
+  .bar i.fail { background: #f85149; }
+  .err { font-size: 11px; color: #f87171; white-space: pre-wrap; word-break: break-word; max-height: 60px; overflow: auto;
+         border: 1px solid #21262d; border-radius: 6px; padding: 6px; background: #0d1117; }
+  .up { color: #8b93a3; font-size: 11px; }
+  footer { padding: 10px 18px; color: #4b5358; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>llm-gateway status</h1>
+  <span class="sub" id="bash"></span>
+  <span class="clk" id="clk"></span>
+</header>
+<main id="cards"></main>
+<footer>
+  data: <span id="src"></span> &middot; recent window: last <span id="win"></span>s of request log
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => (s ?? "").toString().replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function card(j) {
+  const dot = j.reachable ? "ok" : "bad";
+  const odd = new Date(j.latency_ms ? 0 : 0);
+  return `<div class="card">
+    <h2><span class="dot ${dot}"></span>${esc(j.label)} <span class="meta">${esc(j.key)}</span></h2>
+    <div><span class="k">latency:</span> <span class="val">${j.latency_ms ? j.latency_ms + " ms" : "—"}</span> ·
+         <span class="k">models:</span> <span class="val">${j.reachable ? j.model_count : "unreachable"}</span></div>
+    <div class="models">${j.models && j.models.length ? j.models.map(m => `<mark>${esc(m)}</mark>`).join(" · ") : "<span class='k'>no /models listing</span>"}</div>
+  </div>`;
+}
+
+function recentCard(name, r) {
+  const tot = r.ok + r.fail;
+  const pct = tot ? (r.ok / tot * 100) : 100;
+  return `<div class="card">
+    <h2><span class="dot ${r.fail ? (r.ok ? "warn" : "bad") : "ok"}"></span>${esc(name)} <span class="meta">last ${$("win").textContent}s</span></h2>
+    <div class="rec"><span class="k">${r.ok} ok / ${r.fail} fail</span>
+      <span class="bar"><i class="fail" style="width:${100 - pct}%"></i><i style="width:${pct}%"></i></span></div>
+    <div class="up">${esc(r.last_upstream || "—")}</div>
+    ${esc(r.last_error) ? `<div class="err">${esc(r.last_error)}</div>` : ""}
+  </div>`;
+}
+
+async function refresh() {
+  try {
+    const j = await (await fetch("/status.json")).json();
+    $("bash").textContent = `${esc(j.app)} v${esc(j.version)}`;
+    $("src").textContent = document.title + " @ " + esc(j.ts);
+    $("win").textContent = j.recent.window_s;
+
+    let html = "";
+    for (const k of Object.keys(j.providers)) html += card(j.providers[k]);
+    for (const k of Object.keys(j.recent.providers)) html += recentCard(k, j.recent.providers[k]);
+    const rec = j.recent;
+    html += `<div class="card"><h2><span class="dot ${rec.errors ? "warn" : "ok"}"></span>requests</h2>
+      <div class="rec"><span class="k">${rec.requests} in ${rec.window_s}s, ${rec.errors} errors</span></div></div>`;
+    $("cards").innerHTML = html;
+  } catch (e) {
+    $("cards").innerHTML = `<div class="card"><h2><span class="dot bad"></span>status.json unreachable</h2><div class="err">${esc(e)}</div></div>`;
+  }
+}
+
+setInterval(() => { $("clk").textContent = new Date().toLocaleTimeString(); }, 1000);
+setInterval(refresh, 3000);
+refresh();
+</script>
+</body>
+</html>
