@@ -405,7 +405,10 @@ public static class Chat
             {
                 try
                 {
-                    await ctx.Response.WriteAsync($": keep-alive {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}\n\n");
+                    var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    await ctx.Response.WriteAsync(
+                        $"data: {{\"id\":\"gen-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":{now},\"model\":{JsonSerializer.Serialize(model ?? "auto")},\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n");
+                    await ctx.Response.WriteAsync($": keep-alive {now}\n\n");
                     await ctx.Response.Body.FlushAsync();
                 }
                 catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException)
