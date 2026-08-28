@@ -35,6 +35,7 @@ public static class Env
     // DPSK leg of the auto chain can serve a DIFFERENT model than OCG (e.g. the
     // cheapest OCG-only model like mimo-v2.5) — DeepSeek may not serve it.
     public static string DpskFallbackModel { get; } = EnvOr("DPSK_FALLBACK_MODEL", "deepseek-v4-flash");
+    public static string OrFallbackModel { get; } = EnvOr("OR_FALLBACK_MODEL", "deepseek/deepseek-v4-flash");
     // OpenRouter free leg — first in the auto chain (free tier; falls back on
     // 429 rate limits). openrouter/free routes to whatever free model is up.
     public static string OrModel { get; } = EnvOr("OR_MODEL", "openrouter/free");
@@ -314,17 +315,21 @@ public static class Providers
             var chain = new List<(string Key, string Upstream)>();
             foreach (var k in AgnoOrder.Where(k => k != "local"))
             {
+                if (k == "dpsk") continue; // direct DeepSeek api is unfunded (always 402) — funded OR fallback added below
                 var want = k switch
                 {
                     "or" => Env.OrModel,
-                    "dpsk" => Env.DpskFallbackModel,
                     _ => Env.AutoModel,
                 };
                 var up = await ResolveAutoAsync(k, want);
                 if (up is not null) chain.Add((k, up));
             }
+            // last cloud leg: same OpenRouter provider (now credit-funded), serving
+            // DeepSeek v4 flash instead of the unfunded direct api.
+            var orf = await ResolveAutoAsync("or", Env.OrFallbackModel);
+            if (orf is not null) chain.Add(("or", orf));
             if (chain.Count == 0)
-                chain = new List<(string, string)> { ("or", Env.OrModel), ("ocz", Env.AutoModel), ("ocg", Env.AutoModel), ("dpsk", Env.DpskFallbackModel) };
+                chain = new List<(string, string)> { ("or", Env.OrModel), ("ocz", Env.AutoModel), ("ocg", Env.AutoModel), ("or", Env.OrFallbackModel) };
             if (LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
