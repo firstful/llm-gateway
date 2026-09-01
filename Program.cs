@@ -1,5 +1,6 @@
 using System.Text.Json.Nodes;
 using LlmGateway;
+using System.IO;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
@@ -30,17 +31,23 @@ app.Use(async (ctx, next) =>
                 ["message"] = e.Message,
                 ["type"] = "invalid_request_error",
                 ["code"] = null,
-            },
+            }
         };
         await ctx.Response.WriteAsync(body.ToJsonString());
     }
 });
 
-Sessions.Init();
-var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
-var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
+// ---------------- /llms.txt (llmstxt.org spec) ----------------
+app.MapGet("/llms.txt", () =>
+{
+    var body = "# llms.txt — llm-gateway (LLM gateway service)\n# OpenAI-compatible multi-provider router with optional RAG.\n\n## Functions\n- POST /v1/chat/completions  — chat completions (OpenAI schema), RAG-augmented\n- POST /v1/responses          — OpenAI Responses API (newer endpoint)\n- GET  /v1/models             — list of available model ids (across providers)\n- GET  /health                — liveness/readiness\n- GET  /status                — provider status snapshot\n- GET  /status.json           — same as /status, JSON only\n- GET  /stats                 — recent request counters / latency\n- GET  /rag-context           — last injected RAG context (debug)\n\n## Sitemap\n- Health:    https://llm.ffilt.us/health\n- Models:    https://llm.ffilt.us/v1/models\n- Status:    https://llm.ffilt.us/status\n- Stats:     https://llm.ffilt.us/stats\n- Notes:     Routes across OpenRouter, OpenAI, Anthropic, Google, xAI, Groq, Mistral, DeepSeek (free fallback).\n- RAG is fail-open; disable per-request with x-no-rag: 1 header.\n- Per-request overrides: x-provider, x-model, x-temperature.\n";
+
+    return Results.Content(body, "text/plain; charset=utf-8", contentType: "text/plain");
+});
 
 // ---------------- chat UI ----------------
+var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
+var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
 app.MapGet("/", () => Results.File(uiPath, "text/html"));
 app.MapGet("/ui", () => Results.File(uiPath, "text/html"));
 app.MapGet("/status", () => Results.File(statusPath, "text/html"));
@@ -81,7 +88,7 @@ app.MapGet("/local/providers", async () =>
     return Results.Json(outObj);
 });
 
-// ---------------- provider status (JSON feed for /status) ----------------
+// ---------------- provider status (JSON feed for /status) ---------------
 app.MapGet("/status.json", async () =>
 {
     var prov = new JsonObject();
@@ -101,7 +108,6 @@ app.MapGet("/status.json", async () =>
                 : new JsonArray(models.OrderBy(x => x, StringComparer.Ordinal).Select(s => (JsonNode)s).ToArray()),
         };
     }
-
     var recent = ReqLog.Recent(Env.ReqLogWindowSeconds);
     var provRec = new JsonObject();
     foreach (var (k, v) in recent.Providers.OrderBy(kv => kv.Key))
@@ -217,32 +223,3 @@ app.MapPost("/v1/chat/completions", Chat.ChatCompletions);
 app.MapPost("/v1/responses", Chat.Responses);
 
 app.Run();
-
-/// <summary>Best-effort snapshot of llama-ctrl /status (cached 5s; null = unreachable).</summary>
-sealed class LocalStatusCache
-{
-    static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(3) };
-    JsonNode? _cache;
-    DateTime _at;
-
-    public JsonObject Get()
-    {
-        var now = DateTime.UtcNow;
-        if (_cache is null || now - _at > TimeSpan.FromSeconds(5))
-        {
-            try
-            {
-                using var resp = Http.GetAsync($"{Env.LocalCtrlUrl}/status").GetAwaiter().GetResult();
-                resp.EnsureSuccessStatusCode();
-                _cache = JsonNode.Parse(resp.Content.ReadAsStringAsync().GetAwaiter().GetResult());
-            }
-            catch { _cache = null; }
-            _at = now;
-        }
-        if (_cache is null)
-            return new JsonObject { ["reachable"] = false, ["detail"] = "ctrl unreachable" };
-        var obj = (_cache as JsonObject)?.DeepClone() as JsonObject ?? new JsonObject();
-        obj["reachable"] = true;
-        return obj;
-    }
-}
