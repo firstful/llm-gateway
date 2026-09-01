@@ -14,16 +14,13 @@ namespace LlmGateway;
 ///   OCZ-&lt;model&gt;    -> opencode zen  (https://opencode.ai/zen/v1) — main API,
 ///                     free models live here under their own ids
 ///   OCG-&lt;model&gt;    -> opencode-go   (https://opencode.ai/zen/go/v1) — weekly-capped
-///   DPSK-&lt;model&gt;   -> deepseek      (https://api.deepseek.com/v1)
 ///   LOCAL-&lt;model&gt;  -> local GPU     (llama-ctrl; ONLY when LOCAL_ENABLED=1)
-///   AGNO-&lt;model&gt;   -> any provider that is available AND serving &lt;model&gt;
-///   auto           -> AGNO order legs with per-provider model resolution
-///                     (ResolveAutoAsync), then LOCAL-&lt;LOCAL_MODEL&gt;
-///                     (final fallback, if enabled)
+///   auto           -> explicit ordered fallback chain — see AUTO_CHAIN
+///                     (comma-separated "provider:model" legs, tried in
+///                     sequence), then LOCAL-&lt;LOCAL_MODEL&gt; if enabled
 ///
 /// Chat sessions persist server-side (SQLite + cookie), the UI shows live
-/// provider + local-LLM status, and AGNO-&lt;model&gt; is only advertised when >=2
-/// providers actually serve it.
+/// provider + local-LLM status.
 /// LAN-only service (llm.homelab.internal) + user-facing UI at llm.ffilt.us.
 /// </summary>
 public static class Env
@@ -31,14 +28,13 @@ public static class Env
     public const string AppName = "llm-gateway";
     public const string AppVersion = "2.1.0";
 
-    public static string AutoModel { get; } = EnvOr("AUTO_MODEL", "deepseek-v4-flash");
-    // DPSK leg of the auto chain can serve a DIFFERENT model than OCG (e.g. the
-    // cheapest OCG-only model like mimo-v2.5) — DeepSeek may not serve it.
-    public static string DpskFallbackModel { get; } = EnvOr("DPSK_FALLBACK_MODEL", "deepseek-v4-flash");
-    public static string OrFallbackModel { get; } = EnvOr("OR_FALLBACK_MODEL", "deepseek/deepseek-v4-flash");
-    // OpenRouter free leg — first in the auto chain (free tier; falls back on
-    // 429 rate limits). openrouter/free routes to whatever free model is up.
-    public static string OrModel { get; } = EnvOr("OR_MODEL", "openrouter/free");
+    // Only used as a fallback advertisement when a provider /models listing
+    // can't be verified. The actual auto chain is explicit — see AUTO_CHAIN.
+    public static string AutoModel { get; } = EnvOr("AUTO_MODEL", "mimo-v2.5");
+    // Explicit ordered fallback chain for `auto`: comma-separated "provider:model"
+    // legs, tried in sequence. Each leg is plainly named — no implicit AGNO rules.
+    public static string AutoChainRaw { get; } = EnvOr(
+        "AUTO_CHAIN", "ocg:mimo-v2.5,or:openrouter/free,or:deepseek/deepseek-v4-flash");
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
@@ -135,12 +131,28 @@ public static class Providers
 
     public static readonly List<Provider> All = Build();
 
-    // AGNO preference order (first available+serving wins)
-    public static readonly List<string> AgnoOrder = Env.EnvOr("AGNO_ORDER", "ocg,dpsk")
-        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-        .Where(k => All.Any(p => p.Key == k)).ToList();
+    // Explicit ordered fallback chain for `auto` (from AUTO_CHAIN). Each leg is
+    // (provider_key, upstream_model); only providers actually in the registry are
+    // kept, so a leg referencing a removed provider is silently dropped.
+    public static readonly List<(string Key, string Model)> AutoChain =
+        Env.AutoChainRaw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ParseLeg)
+            .Where(l => l.Key is not null)
+            .Select(l => (l.Key!, l.Model!))
+            .ToList();
 
-    // fallback on these upstream outcomes for auto/AGNO chains
+    static (string? Key, string? Model) ParseLeg(string leg)
+    {
+        var i = leg.IndexOf(':');
+        if (i <= 0) return (null, null);
+        var key = leg[..i].Trim().ToLowerInvariant();
+        var model = leg[(i + 1)..].Trim();
+        if (model.Length == 0 || !All.Any(p => p.Key == key)) return (null, null);
+        return (key, model);
+    }
+
+    // fallback on these upstream outcomes for auto chains
     public static readonly HashSet<int> FallbackStatus = new() { 401, 402, 403, 408, 429, 500, 502, 503, 504 };
 
     static readonly ConcurrentDictionary<string, (DateTime At, HashSet<string>? Ids)> ModelsCache = new();
@@ -153,7 +165,7 @@ public static class Providers
     };
 
     /// <summary>
-    /// Automatic model resolution for auto/AGNO chain legs: map the desired
+    /// Automatic model resolution for auto chain legs: map the desired
     /// model name to an id the provider actually serves, or null when a
     /// verifiable /models listing shows no match (the leg is skipped so the
     /// chain falls through instead of dying on an upstream 404, which is NOT
@@ -191,7 +203,6 @@ public static class Providers
                 // same OpenCode workspace key serves both zen endpoints — default to the OCG key
                 ApiKey = Env.EnvOr("OCZ_API_KEY", Env.EnvOr("OCG_API_KEY", "")) },
             new() { Key = "ocg", Label = "OCG", BaseUrl = Env.EnvOr("OCG_BASE_URL", "").TrimEnd('/'), ApiKey = Env.EnvOr("OCG_API_KEY", "") },
-            new() { Key = "dpsk", Label = "DPSK", BaseUrl = Env.EnvOr("DPSK_BASE_URL", "").TrimEnd('/'), ApiKey = Env.EnvOr("DPSK_API_KEY", "") },
         };
         if (LocalEnabled)
         {
@@ -304,63 +315,38 @@ public static class Providers
 
         if (low == "auto")
         {
-            // cloud providers first (AGNO order), then the local GPU as FINAL
-            // fallback (if enabled). local serves LOCAL_MODEL, not AUTO_MODEL.
-            // DPSK gets DPSK_FALLBACK_MODEL (DeepSeek may not serve the OCG-only
-            // AUTO_MODEL — keep a model DeepSeek actually has on the fallback leg).
-            // OR gets OR_MODEL (openrouter/free — first leg, free tier).
+            // Explicit ordered fallback chain from AUTO_CHAIN (comma-separated
+            // "provider:model" legs, tried in sequence), then the local GPU as
+            // FINAL fallback (if enabled; serves LOCAL_MODEL, not a chain model).
             // Each leg goes through ResolveAutoAsync: OCZ's ids differ from OCG's
-            // (AUTO_MODEL ox-alpha-free -> x-preview-f-free), and a leg whose
-            // provider verifiably doesn't serve its model is skipped entirely.
+            // (e.g. ox-alpha-free -> x-preview-f-free), and a leg whose provider
+            // verifiably doesn't serve its model is skipped so the chain falls
+            // through instead of dying on an upstream 404 (not in FallbackStatus).
             var chain = new List<(string Key, string Upstream)>();
-            foreach (var k in AgnoOrder.Where(k => k != "local"))
+            foreach (var (k, want) in AutoChain)
             {
-                if (k == "dpsk") continue; // direct DeepSeek api is unfunded (always 402) — funded OR fallback added below
-                var want = k switch
-                {
-                    "or" => Env.OrModel,
-                    _ => Env.AutoModel,
-                };
                 var up = await ResolveAutoAsync(k, want);
                 if (up is not null) chain.Add((k, up));
             }
-            // last cloud leg: same OpenRouter provider (now credit-funded), serving
-            // DeepSeek v4 flash instead of the unfunded direct api.
-            var orf = await ResolveAutoAsync("or", Env.OrFallbackModel);
-            if (orf is not null) chain.Add(("or", orf));
+            // Last resort: if every explicit leg was skipped, relay the raw chain
+            // so the request still attempts them (upstream errors surface clearly).
             if (chain.Count == 0)
-                chain = new List<(string, string)> { ("or", Env.OrModel), ("ocz", Env.AutoModel), ("ocg", Env.AutoModel), ("or", Env.OrFallbackModel) };
+                chain = AutoChain.Select(l => (l.Key, l.Model)).ToList();
             if (LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
 
-        foreach (var key in new[] { "or", "ocz", "ocg", "dpsk", "agno", "local" })
+        foreach (var key in new[] { "or", "ocz", "ocg", "local" })
         {
             if (!low.StartsWith(key + "-")) continue;
             var upstream = m[(key.Length + 1)..].Trim();
             if (upstream.Length == 0)
                 throw new ApiError(400, $"model '{m}': missing upstream model after '{key}-'");
-            if (key is "or" or "ocz" or "ocg" or "dpsk" or "local")
-                return new List<(string, string)> { (key, upstream) };
-            // AGNO: providers that are up AND serving this model, in order
-            var agno = new List<(string, string)>();
-            foreach (var pk in AgnoOrder)
-            {
-                var ids = await ProviderModelsAsync(pk);
-                if (ids is null) continue; // can't verify availability -> skip
-                if (ids.Contains(upstream) || upstream == Env.AutoModel)
-                {
-                    var up = await ResolveAutoAsync(pk, upstream);
-                    if (up is not null) agno.Add((pk, up));
-                }
-            }
-            if (agno.Count == 0)
-                throw new ApiError(404, $"AGNO: no provider available and serving '{upstream}'");
-            return agno;
+            return new List<(string, string)> { (key, upstream) };
         }
 
         throw new ApiError(404,
-            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/DPSK-/LOCAL-/AGNO-) or 'auto'.");
+            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/LOCAL-) or 'auto'.");
     }
 
     /// <summary>Fire one request at one provider. stream=true -> SSE relay path.</summary>

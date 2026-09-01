@@ -175,26 +175,6 @@ app.MapGet("/v1/models", async () =>
         foreach (var mid in served.OrderBy(x => x, StringComparer.Ordinal))
             ids.Add($"{p.Label}-{mid}");
     }
-    // AGNO-<model> only when >=2 providers actually serve it
-    if (Providers.All.Count >= 2)
-    {
-        var union = new HashSet<string>();
-        foreach (var p in Providers.All)
-        {
-            var served = await Providers.ProviderModelsAsync(p.Key);
-            if (served is { Count: > 0 }) union.UnionWith(served);
-        }
-        foreach (var mid in union.OrderBy(x => x, StringComparer.Ordinal))
-        {
-            var count = 0;
-            foreach (var p in Providers.All)
-            {
-                var served = await Providers.ProviderModelsAsync(p.Key);
-                if (served is { Count: > 0 } && served.Contains(mid)) count++;
-            }
-            if (count >= 2) ids.Add($"AGNO-{mid}");
-        }
-    }
     // de-dup preserving order
     var seen = new HashSet<string>();
     var data = new JsonArray();
