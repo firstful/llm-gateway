@@ -28,7 +28,21 @@ public static class Chat
     }
 
     static string? SessionId(HttpContext ctx)
-        => ctx.Request.Cookies[Env.SessionCookie];
+    {
+        var sid = ctx.Request.Cookies[Env.SessionCookie];
+        if (string.IsNullOrEmpty(sid))
+        {
+            sid = Guid.NewGuid().ToString("N");
+            // Set cookie before response body is written
+            ctx.Response.Cookies.Append(Env.SessionCookie, sid, new CookieOptions
+            {
+                MaxAge = TimeSpan.FromDays(Env.SessionTtlDays),
+                HttpOnly = true,
+                SameSite = SameSiteMode.Lax
+            });
+        }
+        return sid;
+    }
 
     static void SaveSessionFrom(HttpContext ctx, JsonArray? messages, string model, string reply)
     {
