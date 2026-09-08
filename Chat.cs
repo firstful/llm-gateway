@@ -179,7 +179,7 @@ public static class Chat
                 payload["model"] = upstream;
                 Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
                 HttpResponseMessage resp;
-                try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false); }
+                try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, SessionId(ctx)); }
                 catch (Exception e)
                 {
                     lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
@@ -255,7 +255,7 @@ public static class Chat
             Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
             HttpResponseMessage resp;
             var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, true); }
+            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, true, SessionId(ctx)); }
             catch (Exception e)
             {
                 streamErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
@@ -543,7 +543,7 @@ public static class Chat
             payload["model"] = upstream;
             Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
             HttpResponseMessage resp;
-            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false); }
+            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, SessionId(ctx)); }
             catch (Exception e)
             {
                 lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";

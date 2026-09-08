@@ -310,7 +310,7 @@ public static class Providers
 
     /// <summary>Fire one request at one provider. stream=true -> SSE relay path.</summary>
     public static async Task<(HttpResponseMessage Resp, HttpClient Client)> UpstreamAsync(
-        string key, string path, JsonObject body, bool stream)
+        string key, string path, JsonObject body, bool stream, string? sessionId = null)
     {
         var p = ByKey(key) ?? throw new ApiError(502, $"provider '{key}' not configured");
         var req = new HttpRequestMessage(HttpMethod.Post, $"{p.BaseUrl}{path}")
@@ -319,6 +319,9 @@ public static class Providers
         };
         if (!string.IsNullOrEmpty(p.ApiKey))
             req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {p.ApiKey}");
+        // Forward session as x-opencode-session for upstream routing (OpenCode Go requires it)
+        if (!string.IsNullOrEmpty(sessionId))
+            req.Headers.TryAddWithoutValidation("x-opencode-session", sessionId);
         var resp = await p.Client.SendAsync(req, stream ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead);
         return (resp, p.Client);
     }
