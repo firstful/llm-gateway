@@ -144,6 +144,53 @@ public static class Chat
         catch { return ""; }
     }
 
+    /// <summary>Short human reason for a failed provider attempt (from its error body).</summary>
+    static string ShortReason(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        try
+        {
+            var par = JsonNode.Parse(raw) as JsonObject;
+            var em = par?["error"]?["message"]?.GetValue<string>();
+            if (!string.IsNullOrEmpty(em))
+                return em.Length <= 90 ? em : em[..90];
+        }
+        catch { /* fall back to raw snippet */ }
+        var s = raw!.Replace('\n', ' ').Trim();
+        return s.Length <= 90 ? s : s[..90];
+    }
+
+    /// <summary>Clear aggregated "everything failed" message: one line per provider.</summary>
+    static string SummarizeFailures(string model, IReadOnlyList<ReqLog.Attempt> attempts)
+    {
+        if (attempts.Count == 0) return $"all providers failed for model '{model}'";
+        var parts = new List<string>();
+        for (var i = 0; i < attempts.Count; i++)
+        {
+            var a = attempts[i];
+            var reason = a.Outcome == "unreachable"
+                ? $"unreachable ({ShortReason(a.Detail)})"
+                : $"HTTP {a.Status} {ShortReason(a.Detail)}".Trim();
+            parts.Add($"[{i + 1}] {a.Provider}: {reason}");
+        }
+        var msg = $"all providers failed for model '{model}': {string.Join("; ", parts)}.";
+
+        var allRateLimited = attempts.Count > 0 && attempts.All(a =>
+            a.Status == 429 || (a.Detail?.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ?? false));
+        var balanceShort = attempts.Any(a => (a.Detail?.Contains("insufficient balance", StringComparison.OrdinalIgnoreCase) ?? false)
+            || (a.Detail?.Contains("insufficient_quota", StringComparison.OrdinalIgnoreCase) ?? false));
+
+        if (allRateLimited)
+            msg += " Every provider is quota-limited right now — no free tier is available at this moment. " +
+                   "Stop and retry after a reset window (usually the next hour/day); it is not a transient glitch.";
+        else if (balanceShort)
+            msg += " At least one provider needs a balance top-up — consider adding a small credit balance " +
+                   "to unlock its free tier again (e.g. OpenRouter: even $10 unlocks 1000 free-model requests/day).";
+        else
+            msg += " No fallback served this request — rate limits are time-based, so retry in a bit.";
+        return msg;
+    }
+
     // ---------------- /v1/chat/completions ----------------
 
     public static async Task ChatCompletions(HttpContext ctx)
@@ -240,14 +287,15 @@ public static class Chat
             ReqLog.Write(ctx, "chat", model, false,
                 502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - nsT00, nsAttempts,
                 new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-                $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
-            throw new ApiError(502, $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
+                SummarizeFailures(model ?? "auto", nsAttempts));
+            throw new ApiError(502, SummarizeFailures(model ?? "auto", nsAttempts));
         }
 
         // streaming: pick the first provider that responds 2xx, stream its SSE
         var t00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var attempts = new List<ReqLog.Attempt>();
         string? streamErr = null;
+    streamRetry:
         foreach (var (key, upstream) in routes)
         {
             var payload = (JsonObject)body.DeepClone();
@@ -278,8 +326,11 @@ public static class Chat
                     ReqLog.Write(ctx, "chat", model, true,
                         status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
                         new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, null);
-                    ctx.Response.StatusCode = status;
-                    ctx.Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
+                    if (!ctx.Response.HasStarted)
+                    {
+                        ctx.Response.StatusCode = status;
+                        ctx.Response.ContentType = resp.Content.Headers.ContentType?.ToString() ?? "application/json";
+                    }
                     await ctx.Response.Body.WriteAsync(raw);
                     return;
                 }
@@ -291,9 +342,12 @@ public static class Chat
             }
 
             // relay SSE incrementally; accumulate for post-processing
-            ctx.Response.StatusCode = 200;
-            ctx.Response.ContentType = "text/event-stream";
-            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            if (!ctx.Response.HasStarted)
+            {
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.Headers["Cache-Control"] = "no-cache";
+            }
             var sid = SessionId(ctx);
             var chunks = new MemoryStream();
             try
@@ -337,11 +391,66 @@ public static class Chat
             }
             return;
         }
+        // All providers failed. Do NOT end the turn — keep the SSE stream open,
+        // emitting keep-alive comments until a provider comes back (or the client
+        // leaves / the cap is hit), then retry the chain from the top.
+        if (!ctx.RequestAborted.IsCancellationRequested)
+        {
+            var waitStart = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var capMs = Env.RecoveryMaxWaitSeconds * 1000L;
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            while (true)
+            {
+                try
+                {
+                    var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    await ctx.Response.WriteAsync(
+                        $"data: {{\"id\":\"gen-keepalive\",\"object\":\"chat.completion.chunk\",\"created\":{now},\"model\":{JsonSerializer.Serialize(model ?? "auto")},\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"\"}},\"finish_reason\":null}}]}}\n\n");
+                    await ctx.Response.WriteAsync($": keep-alive {now}\n\n");
+                    await ctx.Response.Body.FlushAsync();
+                }
+                catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException)
+                {
+                    return; // client went away mid-keepalive
+                }
+                try { await Task.Delay(TimeSpan.FromSeconds(Env.RecoveryKeepAliveSeconds), ctx.RequestAborted); }
+                catch (OperationCanceledException) { return; } // client went away
+
+                var recovered = new List<(string Key, string Upstream)>();
+                foreach (var (k, up) in routes)
+                    if (await Providers.ProbeAsync(k) is { Reachable: true } probe)
+                        recovered.Add((k, up));
+                if (recovered.Count > 0)
+                {
+                    routes = recovered;
+                    attempts = new List<ReqLog.Attempt>();
+                    goto streamRetry;
+                }
+                if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - waitStart > capMs)
+                    break;
+            }
+            var gaveup = SummarizeFailures(model ?? "auto", attempts);
+            ReqLog.Write(ctx, "chat", model, true,
+                502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
+                new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, gaveup);
+            try
+            {
+                await ctx.Response.WriteAsync($"data: {{\"error\":{{\"message\":{JsonSerializer.Serialize(gaveup)}}}}}\n\n");
+                await ctx.Response.WriteAsync("data: [DONE]\n\n");
+                await ctx.Response.Body.FlushAsync();
+            }
+            catch (Exception e) when (e is OperationCanceledException or IOException or ObjectDisposedException)
+            {
+                // client already gone; nothing to say
+            }
+            return;
+        }
         ReqLog.Write(ctx, "chat", model, true,
             502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
             new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-            $"all providers failed for model '{model}': {streamErr ?? "unknown"}");
-        throw new ApiError(502, $"all providers failed for model '{model}': {streamErr ?? "unknown"}");
+            SummarizeFailures(model ?? "auto", attempts));
     }
 
     // ---------------- /v1/responses (OpenAI Responses API) ----------------
@@ -608,7 +717,7 @@ public static class Chat
         ReqLog.Write(ctx, "responses", model, false,
             502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
             new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-            $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
-        throw new ApiError(502, $"all providers failed for model '{model}': {lastErr ?? "unknown"}");
+            SummarizeFailures(model, attempts));
+        throw new ApiError(502, SummarizeFailures(model, attempts));
     }
 }

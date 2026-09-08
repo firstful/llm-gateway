@@ -38,10 +38,12 @@ app.Use(async (ctx, next) =>
 
 Sessions.Init();
 var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
+var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
 
 // ---------------- chat UI ----------------
 app.MapGet("/", () => Results.File(uiPath, "text/html"));
 app.MapGet("/ui", () => Results.File(uiPath, "text/html"));
+app.MapGet("/status", () => Results.File(statusPath, "text/html"));
 
 // ---------------- health ----------------
 app.MapGet("/health", () => new JsonObject
@@ -77,6 +79,54 @@ app.MapGet("/local/providers", async () =>
         };
     }
     return Results.Json(outObj);
+});
+
+// ---------------- provider status (JSON feed for /status) ----------------
+app.MapGet("/status.json", async () =>
+{
+    var prov = new JsonObject();
+    foreach (var p in Providers.All)
+    {
+        var pr = await Providers.ProbeAsync(p.Key);
+        var models = p.Key == "local" ? null : await Providers.ProviderModelsAsync(p.Key);
+        prov[p.Key] = new JsonObject
+        {
+            ["key"] = p.Key,
+            ["label"] = p.Label,
+            ["reachable"] = pr?.Reachable ?? false,
+            ["latency_ms"] = pr?.LatencyMs ?? 0,
+            ["model_count"] = pr?.ModelCount ?? 0,
+            ["models"] = models is null
+                ? new JsonArray()
+                : new JsonArray(models.OrderBy(x => x, StringComparer.Ordinal).Select(s => (JsonNode)s).ToArray()),
+        };
+    }
+
+    var recent = ReqLog.Recent(Env.ReqLogWindowSeconds);
+    var provRec = new JsonObject();
+    foreach (var (k, v) in recent.Providers.OrderBy(kv => kv.Key))
+        provRec[k] = new JsonObject
+        {
+            ["ok"] = v.Ok,
+            ["fail"] = v.Fail,
+            ["last_error"] = ReqLog.Trunc(v.LastError),
+            ["last_upstream"] = v.LastUpstream,
+        };
+
+    return Results.Json(new JsonObject
+    {
+        ["ts"] = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+        ["app"] = Env.AppName,
+        ["version"] = Env.AppVersion,
+        ["providers"] = prov,
+        ["recent"] = new JsonObject
+        {
+            ["window_s"] = Env.ReqLogWindowSeconds,
+            ["requests"] = recent.Requests,
+            ["errors"] = recent.Errors,
+            ["providers"] = provRec,
+        },
+    });
 });
 
 // ---------------- chat sessions (cookie-keyed, v1.7.0) ----------------
@@ -124,26 +174,6 @@ app.MapGet("/v1/models", async () =>
         if (served is null) served = new HashSet<string> { Env.AutoModel }; // can't verify -> advertise default only
         foreach (var mid in served.OrderBy(x => x, StringComparer.Ordinal))
             ids.Add($"{p.Label}-{mid}");
-    }
-    // AGNO-<model> only when >=2 providers actually serve it
-    if (Providers.All.Count >= 2)
-    {
-        var union = new HashSet<string>();
-        foreach (var p in Providers.All)
-        {
-            var served = await Providers.ProviderModelsAsync(p.Key);
-            if (served is { Count: > 0 }) union.UnionWith(served);
-        }
-        foreach (var mid in union.OrderBy(x => x, StringComparer.Ordinal))
-        {
-            var count = 0;
-            foreach (var p in Providers.All)
-            {
-                var served = await Providers.ProviderModelsAsync(p.Key);
-                if (served is { Count: > 0 } && served.Contains(mid)) count++;
-            }
-            if (count >= 2) ids.Add($"AGNO-{mid}");
-        }
     }
     // de-dup preserving order
     var seen = new HashSet<string>();
