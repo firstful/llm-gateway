@@ -367,6 +367,43 @@ public static class Providers
         return (resp, p.Client);
     }
 
+    /// <summary>
+    /// OpenCode Go thinking models ([1210]) accept ONLY low|high|max.
+    /// Hermes sends provider-agnostic values (none|minimal|low|medium|high|
+    /// xhigh|max|ultra) — clamp to the nearest accepted level per leg.
+    /// Fail-open: unknown/missing values are left untouched.
+    /// </summary>
+    public static void NormalizeReasoningEffort(JsonObject body, string providerKey)
+    {
+        if (providerKey is not ("ocg" or "ocz")) return;
+        // top-level reasoning_effort (chat.completions form)
+        if (body["reasoning_effort"] is JsonValue v && v.TryGetValue<string>(out var e))
+        {
+            var clamped = e.Trim().ToLowerInvariant() switch
+            {
+                "none" or "minimal" or "medium" => "low",
+                "xhigh" => "high",
+                "ultra" => "max",
+                var other when other is not ("low" or "high" or "max") => "low",
+                _ => null, // already valid
+            };
+            if (clamped is not null) body["reasoning_effort"] = clamped;
+        }
+        // Responses-API form: "reasoning": {"effort": "..."}
+        if (body["reasoning"] is JsonObject r && r["effort"] is JsonValue rv && rv.TryGetValue<string>(out var re))
+        {
+            var clamped = re.Trim().ToLowerInvariant() switch
+            {
+                "none" or "minimal" or "medium" => "low",
+                "xhigh" => "high",
+                "ultra" => "max",
+                var other when other is not ("low" or "high" or "max") => "low",
+                _ => null,
+            };
+            if (clamped is not null) r["effort"] = clamped;
+        }
+    }
+
     public static bool IsThinkingModel(string name)
     {
         var low = (name ?? "").ToLowerInvariant();

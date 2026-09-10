@@ -239,6 +239,7 @@ public static class Chat
                 var payload = (JsonObject)body.DeepClone();
                 payload["model"] = upstream;
                 Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
+                Providers.NormalizeReasoningEffort(payload, key);
                 HttpResponseMessage resp;
                 try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, SessionId(ctx)); }
                 catch (Exception e)
@@ -289,6 +290,13 @@ public static class Chat
                     {
                         ctx.Response.StatusCode = status;
                         ctx.Response.ContentType = "application/json";
+                        // X-LLM-Model: the model that ACTUALLY served this request.
+                        // OCG/OCZ legs: we dictate the model, so body echo == leg model.
+                        // OR free legs: openrouter/free resolves inside the body
+                        // ("model": "org/model:free") — prefer the body's answer.
+                        var served = (content as JsonObject)?["model"]?.GetValue<string>();
+                        ctx.Response.Headers["X-LLM-Model"] =
+                            string.IsNullOrEmpty(served) ? $"{key}:{upstream}" : $"{key}:{served}";
                         await ctx.Response.WriteAsync(content.ToJsonString());
                         return;
                     }
@@ -315,6 +323,7 @@ public static class Chat
             var payload = (JsonObject)body.DeepClone();
             payload["model"] = upstream;
             Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
+                Providers.NormalizeReasoningEffort(payload, key);
             HttpResponseMessage resp;
             var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, true, SessionId(ctx)); }
@@ -361,6 +370,11 @@ public static class Chat
                 ctx.Response.StatusCode = 200;
                 ctx.Response.ContentType = "text/event-stream";
                 ctx.Response.Headers["Cache-Control"] = "no-cache";
+                // X-LLM-Model on streaming too — must be set before the body
+                // starts. Streaming never re-parses the SSE for the resolved
+                // model, so this is the LEG spec (key:upstream). For OCG that
+                // is the model we dictated; OR free legs resolve in-band.
+                ctx.Response.Headers["X-LLM-Model"] = $"{key}:{upstream}";
             }
             var sid = SessionId(ctx);
             var chunks = new MemoryStream();
@@ -665,6 +679,7 @@ public static class Chat
             var payload = (JsonObject)chatPayload.DeepClone();
             payload["model"] = upstream;
             Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
+                Providers.NormalizeReasoningEffort(payload, key);
             HttpResponseMessage resp;
             try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, SessionId(ctx)); }
             catch (Exception e)
