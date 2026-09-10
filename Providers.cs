@@ -376,6 +376,15 @@ public static class Providers
     public static void NormalizeReasoningEffort(JsonObject body, string providerKey)
     {
         if (providerKey is not ("ocg" or "ocz")) return;
+
+        // OCG rejects message-level "name" fields ([invalid_request_error]
+        // "name is not supported by this endpoint"). Strip them — the field is
+        // optional decoration in chat.completions and OCG never uses it.
+        if (body["messages"] is JsonArray msgs)
+            foreach (var node in msgs)
+                if (node is JsonObject msg && msg.ContainsKey("name"))
+                    msg.Remove("name");
+
         // top-level reasoning_effort (chat.completions form)
         if (body["reasoning_effort"] is JsonValue v && v.TryGetValue<string>(out var e))
         {
