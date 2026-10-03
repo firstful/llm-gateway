@@ -35,6 +35,17 @@ public static class Env
     // legs, tried in sequence. Each leg is plainly named — no implicit AGNO rules.
     public static string AutoChainRaw { get; } = EnvOr(
         "AUTO_CHAIN", "ocg:mimo-v2.5,or:openrouter/free,or:deepseek/deepseek-v4-flash");
+    // Ordered chain for the `free` pseudo-model: every zero-cost leg (opencode
+    // zen free ids, opencode-go "Unlimited" free ids, OpenRouter free router).
+    // Same syntax as AUTO_CHAIN; legs whose model the provider doesn't serve are
+    // skipped at resolve time.
+    public static string FreeChainRaw { get; } = EnvOr(
+        "FREE_CHAIN",
+        "ocz:space-bunny-free,ocz:longcat-2.5-preview-free,ocz:mimo-v2.6-flash-free," +
+        "ocz:mimo-v2.5-free,ocz:fledge-alpha-free,ocz:ling-3.1-flash-free," +
+        "ocz:ling-3.0-flash-fin-free,ocz:nemotron-3-ultra-free,ocz:nemotron-3.5-lightning-free," +
+        "ocg:space-bunny-free,ocg:longcat-2.5-preview-free," +
+        "or:openrouter/free");
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
@@ -134,13 +145,7 @@ public static class Providers
     // Explicit ordered fallback chain for `auto` (from AUTO_CHAIN). Each leg is
     // (provider_key, upstream_model); only providers actually in the registry are
     // kept, so a leg referencing a removed provider is silently dropped.
-    public static readonly List<(string Key, string Model)> AutoChain =
-        Env.AutoChainRaw
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(ParseLeg)
-            .Where(l => l.Key is not null)
-            .Select(l => (l.Key!, l.Model!))
-            .ToList();
+    public static readonly List<(string Key, string Model)> AutoChain = ParseChain(Env.AutoChainRaw);
 
     static (string? Key, string? Model) ParseLeg(string leg)
     {
@@ -151,6 +156,17 @@ public static class Providers
         if (model.Length == 0 || !All.Any(p => p.Key == key)) return (null, null);
         return (key, model);
     }
+
+    // Ordered chain for the `free` pseudo-model (from FREE_CHAIN). Same
+    // "provider:model" leg syntax as AUTO_CHAIN.
+    public static readonly List<(string Key, string Model)> FreeChain = ParseChain(Env.FreeChainRaw);
+
+    static List<(string Key, string Model)> ParseChain(string raw) =>
+        raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ParseLeg)
+            .Where(l => l.Key is not null)
+            .Select(l => (l.Key!, l.Model!))
+            .ToList();
 
     // fallback on these upstream outcomes for auto chains
     public static readonly HashSet<int> FallbackStatus = new() { 401, 402, 403, 408, 429, 500, 502, 503, 504 };
@@ -313,17 +329,19 @@ public static class Providers
         var m = model!.Trim();
         var low = m.ToLowerInvariant();
 
-        if (low == "auto")
+        if (low == "auto" || low == "free")
         {
-            // Explicit ordered fallback chain from AUTO_CHAIN (comma-separated
-            // "provider:model" legs, tried in sequence), then the local GPU as
+            // Explicit ordered fallback chain (comma-separated "provider:model"
+            // legs, tried in sequence), then the local GPU as
             // FINAL fallback (if enabled; serves LOCAL_MODEL, not a chain model).
             // Each leg goes through ResolveAutoAsync: OCZ's ids differ from OCG's
             // (e.g. ox-alpha-free -> x-preview-f-free), and a leg whose provider
             // verifiably doesn't serve its model is skipped so the chain falls
             // through instead of dying on an upstream 404 (not in FallbackStatus).
+            // `free` uses FREE_CHAIN (zero-cost legs only, no LOCAL tail).
+            var legs = low == "free" ? FreeChain : AutoChain;
             var chain = new List<(string Key, string Upstream)>();
-            foreach (var (k, want) in AutoChain)
+            foreach (var (k, want) in legs)
             {
                 var up = await ResolveAutoAsync(k, want);
                 if (up is not null) chain.Add((k, up));
@@ -331,8 +349,8 @@ public static class Providers
             // Last resort: if every explicit leg was skipped, relay the raw chain
             // so the request still attempts them (upstream errors surface clearly).
             if (chain.Count == 0)
-                chain = AutoChain.Select(l => (l.Key, l.Model)).ToList();
-            if (LocalEnabled) chain.Add(("local", Env.LocalModel));
+                chain = legs.Select(l => (l.Key, l.Model)).ToList();
+            if (low == "auto" && LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
 
@@ -346,7 +364,7 @@ public static class Providers
         }
 
         throw new ApiError(404,
-            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/LOCAL-) or 'auto'.");
+            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/LOCAL-), 'auto', or 'free'.");
     }
 
     /// <summary>Fire one request at one provider. stream=true -> SSE relay path.</summary>
