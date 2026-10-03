@@ -114,6 +114,75 @@ public static class Chat
         return parts.ToString();
     }
 
+    /// <summary>
+    /// Replace the "model" field in every <c>data:</c> SSE payload with
+    /// <paramref name="servedModel"/>. Lines that aren't parseable JSON (comments,
+    /// <c>[DONE]</c>, blank keep-alives) are passed through untouched.
+    ///
+    /// The rewrite is a targeted string splice of just the <c>"model":"..."</c>
+    /// span, not a JSON re-serialization: a proxy must not reformat or re-escape
+    /// upstream payloads (field order, unicode escaping, float formatting).
+    /// </summary>
+    static byte[] RewriteSseModel(string block, string servedModel)
+    {
+        var enc = System.Text.Encoding.UTF8;
+        var sb = new StringBuilder(block.Length + 64);
+        var lines = block.Split('\n');
+        for (int i = 0; i < lines.Length; i++)
+        {
+            // Split on '\n' yields a trailing "" for a block that ended in a
+            // newline. Re-emit that element verbatim with no added newline so
+            // the output is byte-identical in framing to the input (no blank
+            // lines accumulate across chunks).
+            bool isTail = i == lines.Length - 1;
+            var line = lines[i];
+            var t = line.TrimEnd('\r');
+            var trailing = line.Length > t.Length ? "\r" : "";
+            if (isTail) { sb.Append(line); continue; }
+            if (!t.StartsWith("data:")) { sb.Append(line).Append('\n'); continue; }
+            var payload = t[5..].Trim();
+            if (payload.Length == 0 || payload == "[DONE]") { sb.Append(line).Append('\n'); continue; }
+            var spliced = SpliceModelField(payload, servedModel);
+            sb.Append("data: ").Append(spliced ?? payload).Append(trailing).Append('\n');
+        }
+        return enc.GetBytes(sb.ToString());
+
+        // Returns the payload with its "model" value replaced, or null to leave
+        // the line alone (no "model" key, or unparseable / ambiguous JSON).
+        static string? SpliceModelField(string payload, string model)
+        {
+            JsonNode? probe;
+            try { probe = JsonNode.Parse(payload); } catch { return null; }
+            if (probe is not JsonObject obj || obj["model"] is null) return null;
+            // Locate the exact "model":"<old>" span within the raw payload text.
+            // Searching from the front is safe because a bare `"model"` key must
+            // appear before any nested occurrence; we additionally require the
+            // value to be a plain string so we never touch a nested object.
+            var needle = "\"model\":";
+            var idx = payload.IndexOf(needle, StringComparison.Ordinal);
+            if (idx < 0) return null;
+            var q = payload.IndexOf('"', idx + needle.Length);
+            if (q < 0) return null;
+            // Walk the string to its closing quote, honouring backslash escapes.
+            int end = q + 1;
+            while (end < payload.Length)
+            {
+                if (payload[end] == '\\') { end += 2; continue; }
+                if (payload[end] == '"') break;
+                end++;
+            }
+            if (end >= payload.Length) return null;
+            // Serialize to get correct escaping (servedModel contains ':' but may
+            // legitimately contain quotes/backslashes), then splice the ESCAPED
+            // INNER text between the existing quotes — payload[..q+1] already
+            // carries the opening quote and payload[end..] the closing one, so
+            // adding our own quotes here would double them.
+            var escaped = JsonSerializer.Serialize(model);
+            var inner = escaped.Length >= 2 ? escaped[1..^1] : escaped;
+            return payload[..(q + 1)] + inner + payload[end..];
+        }
+    }
+
     /// <summary>Extract usage from the final SSE chunk if the upstream includes it.</summary>
     static (Stats.Usage U, int Cached) SseUsage(byte[] raw)
     {
@@ -295,8 +364,14 @@ public static class Chat
                         // OR free legs: openrouter/free resolves inside the body
                         // ("model": "org/model:free") — prefer the body's answer.
                         var served = (content as JsonObject)?["model"]?.GetValue<string>();
-                        ctx.Response.Headers["X-LLM-Model"] =
-                            string.IsNullOrEmpty(served) ? $"{key}:{upstream}" : $"{key}:{served}";
+                        var servedModel = string.IsNullOrEmpty(served) ? $"{key}:{upstream}" : $"{key}:{served}";
+                        ctx.Response.Headers["X-LLM-Model"] = servedModel;
+                        // Mirror the header into the body's model field. OpenAI-
+                        // compatible clients (Hermes) read response.model, not
+                        // headers, so without this they only ever see the bare
+                        // upstream name with no provider prefix. Informational
+                        // only — nothing downstream routes on this field.
+                        if (content is JsonObject bodyObj) bodyObj["model"] = servedModel;
                         await ctx.Response.WriteAsync(content.ToJsonString());
                         return;
                     }
@@ -383,10 +458,32 @@ public static class Chat
                 await using var stream = await resp.Content.ReadAsStreamAsync();
                 var buf = new byte[81920];
                 int read;
+                // Rewrite "model" in each complete SSE line to servedModel so
+                // OpenAI-compatible clients (Hermes) see the provider-qualified
+                // name in chunk objects, not just the X-LLM-Model header. Reads
+                // split at arbitrary byte offsets, so carry the trailing partial
+                // line and never re-emit it until it terminates.
+                var servedModel = $"{key}:{upstream}";
+                var pending = new MemoryStream();
                 while ((read = await stream.ReadAsync(buf)) > 0)
                 {
                     chunks.Write(buf, 0, read);
-                    await ctx.Response.Body.WriteAsync(buf.AsMemory(0, read));
+                    pending.Write(buf, 0, read);
+                    var pendingArr = pending.ToArray();
+                    var lastNl = Array.LastIndexOf(pendingArr, (byte)'\n');
+                    if (lastNl < 0) continue;
+                    var complete = System.Text.Encoding.UTF8.GetString(pendingArr, 0, lastNl + 1);
+                    pending.SetLength(0);
+                    pending.Write(pendingArr, lastNl + 1, pendingArr.Length - lastNl - 1);
+                    var rewritten = RewriteSseModel(complete, servedModel);
+                    await ctx.Response.Body.WriteAsync(rewritten);
+                    await ctx.Response.Body.FlushAsync();
+                }
+                // Flush any trailing partial line (stream ended without newline).
+                if (pending.Length > 0)
+                {
+                    var tail = RewriteSseModel(System.Text.Encoding.UTF8.GetString(pending.ToArray()), servedModel);
+                    await ctx.Response.Body.WriteAsync(tail);
                     await ctx.Response.Body.FlushAsync();
                 }
             }
