@@ -35,17 +35,25 @@ public static class Env
     // legs, tried in sequence. Each leg is plainly named — no implicit AGNO rules.
     public static string AutoChainRaw { get; } = EnvOr(
         "AUTO_CHAIN", "ocg:mimo-v2.5,or:openrouter/free,or:deepseek/deepseek-v4-flash");
-    // Ordered chain for the `free` pseudo-model: every zero-cost leg (opencode
-    // zen free ids, opencode-go "Unlimited" free ids, OpenRouter free router).
-    // Same syntax as AUTO_CHAIN; legs whose model the provider doesn't serve are
-    // skipped at resolve time.
+    // Ordered chain for the `free` pseudo-model: ZERO-COST legs only. OpenCode
+    // ZEN is entirely free, so every live zen model is fair game (the zero-cost
+    // *-free ids first, then the rest); OpenCode GO is a paid service, so only its
+    // "Unlimited"-tier models (space-bunny-free, longcat-2.5-preview-free) are used;
+    // openrouter/free last. Override wholesale with the FREE_CHAIN env var.
     public static string FreeChainRaw { get; } = EnvOr(
         "FREE_CHAIN",
-        "ocz:space-bunny-free,ocz:longcat-2.5-preview-free,ocz:mimo-v2.6-flash-free," +
-        "ocz:mimo-v2.5-free,ocz:fledge-alpha-free,ocz:ling-3.1-flash-free," +
-        "ocz:ling-3.0-flash-fin-free,ocz:nemotron-3-ultra-free,ocz:nemotron-3.5-lightning-free," +
-        "ocg:space-bunny-free,ocg:longcat-2.5-preview-free," +
-        "or:openrouter/free");
+        "ocz:big-pickle,ocz:ling-3.1-flash-free,ocz:fledge-alpha-free,ocz:mimo-v2.5-free,"
+        + "ocz:mimo-v2.6-flash-free,ocz:muse-spark-1.2-contributor-free,ocz:muse-spark-1.3-contributor-free,ocz:nemotron-3.5-lightning-free,"
+        + "ocz:jev-1.13-free,ocz:longcat-2.5-preview-free,ocz:space-bunny-free,ocz:jev-1.13,"
+        + "ocz:claude-fable-5-1,ocz:claude-haiku-4-5,ocz:claude-opus-5-5,ocz:claude-sonnet-5-5,"
+        + "ocz:deepseek-v4.1-flash,ocz:deepseek-v4-pro,ocz:gemini-3.1-pro,ocz:gemini-3.5-flash-lite,"
+        + "ocz:gemini-3.8-flash,ocz:glm-5.3,ocz:glm-5.3-flash,ocz:gpt-5.3-codex,"
+        + "ocz:gpt-5.3-codex-spark,ocz:gpt-5.4-mini,ocz:gpt-5.4-nano,ocz:gpt-5.5,"
+        + "ocz:gpt-5.5-pro,ocz:gpt-6-astra,ocz:gpt-6-sol,ocz:gpt-6.1-sol,"
+        + "ocz:gpt-6-luna,ocz:gpt-5.6-terra,ocz:grok-4.7,ocz:grok-build-0.1,"
+        + "ocz:kimi-k2.7-code,ocz:kimi-k3,ocz:minimax-m3,ocz:muse-spark-1.3,"
+        + "ocz:qwen3.6-plus,ocz:qwen3.8-flash,ocg:space-bunny-free,ocg:longcat-2.5-preview-free,"
+        + "or:openrouter/free,");
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
