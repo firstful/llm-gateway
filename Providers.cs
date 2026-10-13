@@ -339,14 +339,22 @@ public static class Providers
 
         if (low == "auto" || low == "free")
         {
-            // Explicit ordered fallback chain (comma-separated "provider:model"
-            // legs, tried in sequence), then the local GPU as
-            // FINAL fallback (if enabled; serves LOCAL_MODEL, not a chain model).
-            // Each leg goes through ResolveAutoAsync: OCZ's ids differ from OCG's
-            // (e.g. ox-alpha-free -> x-preview-f-free), and a leg whose provider
-            // verifiably doesn't serve its model is skipped so the chain falls
-            // through instead of dying on an upstream 404 (not in FallbackStatus).
-            // `free` uses FREE_CHAIN (zero-cost legs only, no LOCAL tail).
+            // The scorer owns the ranked list; the serving path is a dumb
+            // executor that walks it top-to-bottom until one model works.
+            // OpenCode Go only -- OpenRouter and OpenCode Zen were dropped.
+            var ranked = ModelScorerService.Current;
+            if (ranked.Length > 0)
+            {
+                var picks = low == "free"
+                    ? Array.FindAll(ranked, ModelScorerService.IsFree)
+                    : ranked;
+                if (picks.Length > 0)
+                    return picks.Select(m => (Key: "ocg", Upstream: m)).ToList();
+            }
+
+            // Cold start: the background scorer has not completed its first
+            // pass yet. Serve from the configured chain rather than handing
+            // back an empty route list.
             var legs = low == "free" ? FreeChain : AutoChain;
             var chain = new List<(string Key, string Upstream)>();
             foreach (var (k, want) in legs)
@@ -354,11 +362,8 @@ public static class Providers
                 var up = await ResolveAutoAsync(k, want);
                 if (up is not null) chain.Add((k, up));
             }
-            // Last resort: if every explicit leg was skipped, relay the raw chain
-            // so the request still attempts them (upstream errors surface clearly).
             if (chain.Count == 0)
                 chain = legs.Select(l => (l.Key, l.Model)).ToList();
-            if (low == "auto" && LocalEnabled) chain.Add(("local", Env.LocalModel));
             return chain;
         }
 

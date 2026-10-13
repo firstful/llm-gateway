@@ -5,6 +5,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Logging.SetMinimumLevel(LogLevel.Warning);
 builder.Services.AddHostedService<LiveFlusherService>();
 builder.Services.AddHostedService<StatsFlusherService>();
+builder.Services.AddHostedService<ModelScorerService>();
 
 // PORT env parity with the Python version (ASPNETCORE_URLS wins if set)
 var port = Environment.GetEnvironmentVariable("PORT");
@@ -119,6 +120,17 @@ app.MapGet("/status.json", async () =>
         ["app"] = Env.AppName,
         ["version"] = Env.AppVersion,
         ["providers"] = prov,
+        ["scorer"] = new JsonObject
+        {
+            ["ready"] = ModelScorerService.Current.Length > 0,
+            ["last_refresh"] = ModelScorerService.LastOk == DateTimeOffset.MinValue
+                ? null : ModelScorerService.LastOk.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
+            ["last_error"] = ModelScorerService.LastError == "" ? null : ModelScorerService.LastError,
+            ["cost_weight"] = ModelScorerService.CostWeight,
+            ["quota"] = ModelScorerService.Quota?["usage"]?.DeepClone(),
+            ["order"] = new JsonArray(ModelScorerService.Current.Select(m => (JsonNode)m!).ToArray()),
+            ["models"] = ModelScorerService.Describe(),
+        },
         ["recent"] = new JsonObject
         {
             ["window_s"] = Env.ReqLogWindowSeconds,

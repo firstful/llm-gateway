@@ -36,10 +36,27 @@ public static class Sessions
                     id TEXT PRIMARY KEY,
                     messages TEXT NOT NULL,      -- JSON array of {role, content}
                     model TEXT NOT NULL DEFAULT 'auto',
+                    served TEXT,                  -- model that actually answered
                     updated_at REAL NOT NULL
                 )
                 """;
             cmd.ExecuteNonQuery();
+
+            // Idempotent migration for databases created before `served`.
+            // SQLite has no ADD COLUMN IF NOT EXISTS, so probe first.
+            using var probe = conn.CreateCommand();
+            probe.CommandText = "PRAGMA table_info(sessions)";
+            var hasServed = false;
+            using (var r = probe.ExecuteReader())
+                while (r.Read())
+                    if (r.GetName(1).Equals("served", StringComparison.OrdinalIgnoreCase))
+                        hasServed = true;
+            if (!hasServed)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE sessions ADD COLUMN served TEXT";
+                alter.ExecuteNonQuery();
+            }
         }
     }
 
@@ -63,7 +80,12 @@ public static class Sessions
         catch { return null; }
     }
 
-    public static void Save(string sid, JsonArray? messages, string model)
+    /// <param name="model">Model as requested (e.g. "auto"). Unchanged semantics:
+    /// resuming a session still honours the alias.</param>
+    /// <param name="served">Model that actually produced the answer. Kept separate
+    /// so conversation text can be attributed to a real model -- 97% of requests
+    /// use "auto", so the requested model alone attributes nothing.</param>
+    public static void Save(string sid, JsonArray? messages, string model, string? served)
     {
         try
         {
@@ -72,16 +94,18 @@ public static class Sessions
                 using var conn = Open();
                 using var cmd = conn.CreateCommand();
                 cmd.CommandText = """
-                    INSERT INTO sessions (id, messages, model, updated_at)
-                    VALUES (@id, @messages, @model, @ts)
+                    INSERT INTO sessions (id, messages, model, served, updated_at)
+                    VALUES (@id, @messages, @model, @served, @ts)
                     ON CONFLICT(id) DO UPDATE SET
                         messages = excluded.messages,
                         model = excluded.model,
+                        served = excluded.served,
                         updated_at = excluded.updated_at
                     """;
                 cmd.Parameters.AddWithValue("@id", sid);
                 cmd.Parameters.AddWithValue("@messages", messages?.ToJsonString() ?? "[]");
                 cmd.Parameters.AddWithValue("@model", model);
+                cmd.Parameters.AddWithValue("@served", (object?)served ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@ts", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
                 cmd.ExecuteNonQuery();
             }

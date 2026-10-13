@@ -44,7 +44,8 @@ public static class Chat
         return sid;
     }
 
-    static void SaveSessionFrom(HttpContext ctx, JsonArray? messages, string model, string reply)
+    static void SaveSessionFrom(HttpContext ctx, JsonArray? messages, string model, string reply,
+        string? served = null)
     {
         var sid = SessionId(ctx);
         if (string.IsNullOrEmpty(sid) || string.IsNullOrWhiteSpace(reply)) return;
@@ -52,7 +53,7 @@ public static class Chat
         if (messages is not null)
             foreach (var m in messages) msgs.Add(m?.DeepClone());
         msgs.Add(new JsonObject { ["role"] = "assistant", ["content"] = reply });
-        Sessions.Save(sid, msgs, model);
+        Sessions.Save(sid, msgs, model, served);
     }
 
     static void TeeTurn(HttpContext ctx, JsonArray? messages, string reply)
@@ -314,6 +315,7 @@ public static class Chat
                 catch (Exception e)
                 {
                     lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
+                    ModelMetrics.Failure($"{key}:{upstream}", 0);
                     nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
                         "unreachable", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
                         $"{e.GetType().Name}: {e.Message}"));
@@ -326,6 +328,7 @@ public static class Chat
                     {
                         var detail = await ErrorSnippetAsync(resp);
                         lastErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
+                        ModelMetrics.Failure($"{key}:{upstream}", status);
                         nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
                             "fallback-status", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0, detail));
                         continue;
@@ -334,21 +337,31 @@ public static class Chat
                     JsonNode? content = null;
                     try { content = JsonNode.Parse(raw); } catch { /* fall through to raw */ }
 
+                    // X-LLM-Model: the model that ACTUALLY served this request.
+                    // OCG legs: we dictate the model, so body echo == leg model.
+                    // Hoisted above the session write so the attribution is
+                    // recorded even when the body is not JSON.
+                    var servedName = (content as JsonObject)?["model"]?.GetValue<string>();
+                    var servedModel = string.IsNullOrEmpty(servedName) ? $"{key}:{upstream}" : $"{key}:{servedName}";
+                    var (u, cached) = UsageFrom(content);
+
                     if (status < 400)
                     {
                         var reply = FirstChoice(content as JsonObject)?["message"]?["content"]?.GetValue<string>() ?? "";
                         TeeTurn(ctx, body["messages"] as JsonArray, reply);
                         if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEcho(content);
-                        SaveSessionFrom(ctx, body["messages"] as JsonArray, model ?? "", reply);
+                        SaveSessionFrom(ctx, body["messages"] as JsonArray, model ?? "", reply, servedModel);
+                        ModelMetrics.Success(servedModel, u.Prompt, u.Completion + u.Reasoning, cached,
+                            ModelScorerService.Cost(servedModel, u.Prompt, u.Completion + u.Reasoning, cached));
                     }
                     else
                     {
+                        ModelMetrics.Failure($"{key}:{upstream}", status);
                         nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
                             "upstream-error", status, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
                             Encoding.UTF8.GetString(raw)[..Math.Min(400, raw.Length)]));
                     }
                     var latency = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0;
-                    var (u, cached) = UsageFrom(content);
                     RecordStat(ctx, "chat", false, status, latency, rag, u);
                     nsAttempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
                         "ok", status, latency, null));
@@ -359,12 +372,6 @@ public static class Chat
                     {
                         ctx.Response.StatusCode = status;
                         ctx.Response.ContentType = "application/json";
-                        // X-LLM-Model: the model that ACTUALLY served this request.
-                        // OCG/OCZ legs: we dictate the model, so body echo == leg model.
-                        // OR free legs: openrouter/free resolves inside the body
-                        // ("model": "org/model:free") — prefer the body's answer.
-                        var served = (content as JsonObject)?["model"]?.GetValue<string>();
-                        var servedModel = string.IsNullOrEmpty(served) ? $"{key}:{upstream}" : $"{key}:{served}";
                         ctx.Response.Headers["X-LLM-Model"] = servedModel;
                         // Mirror the header into the body's model field. OpenAI-
                         // compatible clients (Hermes) read response.model, not
@@ -405,6 +412,7 @@ public static class Chat
             catch (Exception e)
             {
                 streamErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
+                ModelMetrics.Failure($"{key}:{upstream}", 0);
                 attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
                     "unreachable", 0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
                     $"{e.GetType().Name}: {e.Message}"));
@@ -414,6 +422,7 @@ public static class Chat
             if (status >= 400)
             {
                 streamErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
+                ModelMetrics.Failure($"{key}:{upstream}", status);
                 if (routes.Count == 1)
                 {
                     var raw = await resp.Content.ReadAsByteArrayAsync();
@@ -491,6 +500,8 @@ public static class Chat
             {
                 var raw = chunks.ToArray();
                 var reply = SseReplyText(raw);
+                var (u, cached) = SseUsage(raw);
+                var servedModel = $"{key}:{upstream}";
                 if (status < 400)
                 {
                     TeeTurn(ctx, body["messages"] as JsonArray, reply);
@@ -501,11 +512,12 @@ public static class Chat
                         if (body["messages"] is JsonArray orig)
                             foreach (var m in orig) msgs.Add(m?.DeepClone());
                         msgs.Add(new JsonObject { ["role"] = "assistant", ["content"] = reply });
-                        Sessions.Save(sid, msgs, model ?? "");
+                        Sessions.Save(sid, msgs, model ?? "", servedModel);
                     }
+                    ModelMetrics.Success(servedModel, u.Prompt, u.Completion + u.Reasoning, cached,
+                        ModelScorerService.Cost(servedModel, u.Prompt, u.Completion + u.Reasoning, cached));
                 }
                 var latency = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0;
-                var (u, cached) = SseUsage(raw);
                 RecordStat(ctx, "chat", true, status, latency, rag, u);
                 attempts.Add(new ReqLog.Attempt(Providers.ByKey(key)?.Label ?? key, upstream,
                     "ok", status, latency, null));
