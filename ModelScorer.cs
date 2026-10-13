@@ -21,8 +21,25 @@ public static class ModelMetrics
 
     static readonly ConcurrentDictionary<string, Counter> Map = new();
 
+    /// <summary>Normalise a metric key to the bare model id.
+    ///
+    /// The request path records outcomes under "ocg:cat-jam-free" (provider and
+    /// model), but the scorer works from api.json roster ids like
+    /// "cat-jam-free". Keying on the served string as-is meant every lookup
+    /// missed and observed reliability silently collapsed to the prior -- the
+    /// counters were being written all along and never read back.</summary>
+    static string Key(string m)
+    {
+        int c = m.IndexOf(':');
+        if (c <= 0) return m;
+        var prefix = m[..c];
+        if (prefix is "ocg" or "ocz" or "or" or "local")
+            return m[(c + 1)..];
+        return m;
+    }
+
     static Counter Get(string m) =>
-        Map.GetOrAdd(m, _ => new Counter());
+        Map.GetOrAdd(Key(m), _ => new Counter());
 
     public static void Success(string model, long prompt, long completion, long cached, double usd)
     {
@@ -90,6 +107,7 @@ public static class ModelMetrics
 public static class MetricsStore
 {
     const string Path = "/opt/llm-gateway/data/model-metrics.json";
+    static bool Debug => Environment.GetEnvironmentVariable("SESSION_DEBUG") == "1";
 
     public static void Flush()
     {
@@ -118,8 +136,17 @@ public static class MetricsStore
     {
         try
         {
-            if (!File.Exists(Path)) return;
-            if (JsonNode.Parse(File.ReadAllText(Path)) is not JsonObject o) return;
+            if (!File.Exists(Path))
+            {
+                if (Debug) Console.Error.WriteLine($"[metrics] no file at {Path}");
+                return;
+            }
+            if (JsonNode.Parse(File.ReadAllText(Path)) is not JsonObject o)
+            {
+                if (Debug) Console.Error.WriteLine("[metrics] file is not a JSON object");
+                return;
+            }
+            int n = 0;
             foreach (var (m, v) in o)
             {
                 if (v is not JsonObject r) continue;
@@ -132,9 +159,14 @@ public static class MetricsStore
                     (long)(r["p"]?.GetValue<double>() ?? 0),
                     (long)(r["c"]?.GetValue<double>() ?? 0),
                     (long)(r["k"]?.GetValue<double>() ?? 0));
+                n++;
             }
+            Console.WriteLine($"[metrics] restored {n} model counter(s) from {Path}");
         }
-        catch { }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[metrics] load failed: {e.GetType().Name}: {e.Message}");
+        }
     }
 }
 
