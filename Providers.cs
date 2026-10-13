@@ -450,9 +450,18 @@ public static class Providers
 
     public static bool IsThinkingModel(string name)
     {
-        var low = (name ?? "").ToLowerInvariant();
+        if (string.IsNullOrEmpty(name)) return false;
+        // Authoritative: api.json declares reasoning per model. 37 of 37 OpenCode
+        // Go models are reasoning models, and 20 additionally require the
+        // reasoning field replayed on earlier assistant turns.
+        if (ModelScorerService.NeedsReasoningEcho(name)) return true;
+        var low = name.ToLowerInvariant();
         return low.Contains("deepseek") || low.Contains("glm") || low.Contains("reasoner") || low.Contains("think");
     }
+
+    /// <summary>Field this model requires on replayed assistant turns, or null.</summary>
+    public static string? ReasoningField(string? name) =>
+        string.IsNullOrEmpty(name) ? null : ModelScorerService.ReasoningField(name);
 
     /// <summary>Cache reasoning_content from a chat.completions JSON body, keyed by tool_call ids.</summary>
     public static void CacheReasoningEcho(JsonNode? content)
@@ -531,10 +540,14 @@ public static class Providers
             var msg = node as JsonObject;
             if (msg is null) continue;
             if (msg["role"]?.GetValue<string>() != "assistant") continue;
-            if (msg["tool_calls"] is not JsonArray) continue;
             if (msg["reasoning_content"] is not null) continue; // client already echoed it
-            var injected = "";
-            foreach (var tc in msg["tool_calls"] as JsonArray ?? [])
+            var toolCalls = msg["tool_calls"] as JsonArray;
+            // Only tool-call turns can be matched to a cached reasoning block by
+            // call id. For a plain assistant turn we have nothing keyed to it,
+            // so leave the message alone rather than fabricate a field.
+            if (toolCalls is null || toolCalls.Count == 0) continue;
+            var injected = (string?)null;
+            foreach (var tc in toolCalls)
             {
                 var cid = tc?["id"]?.GetValue<string>();
                 if (cid is null) continue;
@@ -543,6 +556,10 @@ public static class Providers
                     if (ReasoningEcho.TryGetValue(cid, out var rc)) { injected = rc; break; }
                 }
             }
+            // Omit the key entirely when nothing was cached: a fabricated empty
+            // string is a different claim from "no reasoning", and models that
+            // validate the field reject the wrong one.
+            if (injected is null) continue;
             msg["reasoning_content"] = injected;
         }
     }

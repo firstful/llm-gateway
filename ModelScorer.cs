@@ -241,6 +241,8 @@ public sealed class ModelScorerService : BackgroundService
     {
         public string Model = "";
         public double Input, Output, CacheRead;
+        public bool Reasoning;
+        public string? InterleavedField;   // e.g. "reasoning_content", when set
         public List<(long Size, double In, double Out, double Cache)> Tiers = new();
         public bool IsFree => Input == 0 && Output == 0;
     }
@@ -311,6 +313,27 @@ public sealed class ModelScorerService : BackgroundService
         return JsonNode.Parse(await resp.Content.ReadAsStringAsync());
     }
 
+    /// <summary>Does this model need its reasoning echoed back on replayed
+    /// assistant turns, and under what field name?
+    ///
+    /// Sourced from api.json's `reasoning` and `interleaved.field`, which is
+    /// the vendor's own declaration. The previous substring heuristic
+    /// ("deepseek" || "glm" || ...) matched 7 of 37 OpenCode Go models and
+    /// missed 30 -- every one of which rejects multi-turn requests with
+    /// "missing required parameter: reasoning_content".</summary>
+public static bool NeedsReasoningEcho(string model)
+    {
+        var r = _state.Rates.FirstOrDefault(x => x.Model == model);
+        return r is not null && r.Reasoning && !string.IsNullOrEmpty(r.InterleavedField);
+    }
+
+    /// <summary>The field this model requires, e.g. "reasoning_content".</summary>
+    public static string? ReasoningField(string model)
+    {
+        var r = _state.Rates.FirstOrDefault(x => x.Model == model);
+        return r?.InterleavedField;
+    }
+
     /// <summary>True when the rate card prices this model at zero. The free
     /// tier is a separate pool (flat daily cap, no USD windows), so `free`
     /// selects from it without needing its own chain.</summary>
@@ -347,6 +370,12 @@ public sealed class ModelScorerService : BackgroundService
                 Input = c["input"]?.GetValue<double>() ?? 0,
                 Output = c["output"]?.GetValue<double>() ?? 0,
                 CacheRead = c["cache_read"]?.GetValue<double>() ?? 0,
+                // api.json declares reasoning capability per model, and the
+                // `interleaved.field` names the field this model requires on
+                // replayed assistant turns. Both come from the vendor rather
+                // than a hand-maintained list.
+                Reasoning = node?["reasoning"]?.GetValue<bool>() ?? false,
+                InterleavedField = (node?["interleaved"] as JsonObject)?["field"]?.GetValue<string>(),
             };
             if (c["tiers"] is JsonArray tiers)
                 foreach (var t in tiers)
