@@ -39,6 +39,7 @@ app.Use(async (ctx, next) =>
 });
 
 Sessions.Init();
+MetricsStore.Load();
 var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
 var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
 

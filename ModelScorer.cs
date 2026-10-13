@@ -42,6 +42,21 @@ public static class ModelMetrics
         if (status == 429) Interlocked.Increment(ref c.RateLimited);
     }
 
+    /// <summary>Restore persisted counters at startup.</summary>
+    public static void Seed(string model, long ok, long fail, long rl, long reqs,
+        double usd, long prompt, long completion, long cached)
+    {
+        var c = Get(model);
+        Interlocked.Exchange(ref c.Ok, ok);
+        Interlocked.Exchange(ref c.Fail, fail);
+        Interlocked.Exchange(ref c.RateLimited, rl);
+        Interlocked.Exchange(ref c.Reqs, reqs);
+        Interlocked.Exchange(ref c.Prompt, prompt);
+        Interlocked.Exchange(ref c.Completion, completion);
+        Interlocked.Exchange(ref c.Cached, cached);
+        lock (c) { c.Usd = usd; }
+    }
+
     public sealed record Snapshot(long Ok, long Fail, long RateLimited, long Reqs,
         double Usd, long Prompt, long Completion, long Cached);
 
@@ -67,6 +82,62 @@ public static class ModelMetrics
 /// long-context tier or a peak multiplier, and silently reported the wrong
 /// one. models.opencode.ai/api.json publishes cost including context tiers.
 /// </summary>
+/// <summary>Persist counters across restarts. Kept in-memory as the source of
+/// truth (no log re-reading, no startup cost) but flushed to a small file
+/// so a deploy does not reset every model's reliability to its prior -- with
+/// counters at zero the ranking reverts to alphabetical order among models
+/// we have thousands of observations for.</summary>
+public static class MetricsStore
+{
+    const string Path = "/opt/llm-gateway/data/model-metrics.json";
+
+    public static void Flush()
+    {
+        try
+        {
+            var snap = ModelMetrics.All();
+            var o = new JsonObject();
+            foreach (var (m, s) in snap)
+                o[m] = new JsonObject
+                {
+                    ["ok"] = s.Ok, ["fail"] = s.Fail,
+                    ["rl"] = s.RateLimited, ["reqs"] = s.Reqs,
+                    ["usd"] = s.Usd, ["p"] = s.Prompt,
+                    ["c"] = s.Completion, ["k"] = s.Cached,
+                };
+            var dir = System.IO.Path.GetDirectoryName(Path);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            var tmp = Path + ".tmp";
+            File.WriteAllText(tmp, o.ToJsonString());
+            File.Move(tmp, Path, true);
+        }
+        catch { }
+    }
+
+    public static void Load()
+    {
+        try
+        {
+            if (!File.Exists(Path)) return;
+            if (JsonNode.Parse(File.ReadAllText(Path)) is not JsonObject o) return;
+            foreach (var (m, v) in o)
+            {
+                if (v is not JsonObject r) continue;
+                ModelMetrics.Seed(m,
+                    (long)(r["ok"]?.GetValue<double>() ?? 0),
+                    (long)(r["fail"]?.GetValue<double>() ?? 0),
+                    (long)(r["rl"]?.GetValue<double>() ?? 0),
+                    (long)(r["reqs"]?.GetValue<double>() ?? 0),
+                    r["usd"]?.GetValue<double>() ?? 0,
+                    (long)(r["p"]?.GetValue<double>() ?? 0),
+                    (long)(r["c"]?.GetValue<double>() ?? 0),
+                    (long)(r["k"]?.GetValue<double>() ?? 0));
+            }
+        }
+        catch { }
+    }
+}
+
 /// <summary>
 /// Keeps the session store inside its size budget.
 ///
@@ -102,6 +173,9 @@ public sealed class SessionPrunerService : BackgroundService
                                 $"[sessions] pruned {conv} conversations: " +
                                 $"{before / 1024 / 1024}MB -> {after / 1024 / 1024}MB");
                     }
+                    // Flush counters on the same tick: cheap, and it bounds how
+                    // much observation history a crash or deploy can lose.
+                    MetricsStore.Flush();
                 }
                 await Task.Delay(TimeSpan.FromSeconds(PollSeconds), ct);
             }
@@ -382,6 +456,13 @@ public sealed class ModelScorerService : BackgroundService
         {
             int c = a.Tier.CompareTo(b.Tier);
             if (c != 0) return c;
+            // Within a tier, evidence beats guessing. A model with observations
+            // outranks an equally-scoring one we have never called -- otherwise
+            // an untested model can win on a tiebreak, which is how an unknown
+            // model ended up serving traffic ahead of one with thousands of
+            // recorded successes.
+            bool ao = a.N > 0, bo = b.N > 0;
+            if (ao != bo) return ao ? -1 : 1;
             c = b.Score.CompareTo(a.Score);
             if (c != 0) return c;
             // deterministic tiebreak so the order never wobbles between runs
