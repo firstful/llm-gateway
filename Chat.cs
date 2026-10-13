@@ -27,12 +27,20 @@ public static class Chat
         }
     }
 
-    static string? SessionId(HttpContext ctx)
+    static string? SessionId(HttpContext ctx, JsonArray? messages = null)
     {
         var sid = ctx.Request.Cookies[Env.SessionCookie];
         if (string.IsNullOrEmpty(sid))
         {
-            sid = Guid.NewGuid().ToString("N");
+            // No cookie: this is a headless client or a fresh agent session.
+            // A running session only appends, so the messages already stored
+            // for it are an exact prefix of what just arrived. Recover that
+            // conversation before falling back to a new id -- otherwise every
+            // request invents a fresh GUID and one long conversation fragments
+            // into dozens of single-turn ones with no way to relate them.
+            sid = Sessions.FindByPrefix(messages);
+            if (sid is null)
+                sid = Guid.NewGuid().ToString("N");
             // Set cookie before response body is written
             ctx.Response.Cookies.Append(Env.SessionCookie, sid, new CookieOptions
             {
@@ -48,16 +56,11 @@ public static class Chat
     /// actually served it, and when. Only the user messages this turn
     /// introduced are stored, so the write is proportional to the delta rather
     /// than to the whole conversation.</summary>
-    static void SaveSessionFrom(HttpContext ctx, JsonArray? messages, string model, string reply,
-        string served, string provider, int status, long latencyMs,
-        Stats.Usage usage, int cached, double usd)
+    static void SaveSessionFrom(HttpContext ctx, Sessions.Turn turn, string? sid = null)
     {
-        var sid = SessionId(ctx);
-        if (string.IsNullOrEmpty(sid) || string.IsNullOrWhiteSpace(reply)) return;
-        var sid2 = sid;
-        Sessions.RecordTurn(sid2, model, served, provider, messages, reply,
-            status, latencyMs,
-            new Sessions.Usage(usage.Prompt, usage.Completion, usage.Reasoning, cached), usd);
+        sid ??= SessionId(ctx, turn.Messages);
+        if (string.IsNullOrEmpty(sid) || string.IsNullOrWhiteSpace(turn.Reply)) return;
+        Sessions.RecordTurn(sid, turn);
     }
 
     static void TeeTurn(HttpContext ctx, JsonArray? messages, string reply)
@@ -286,6 +289,9 @@ public static class Chat
         var body = await ParseBody(ctx);
         if (body is null) throw new ApiError(400, "request body must be JSON");
         var model = body!["model"]?.GetValue<string>();
+        // Resolve the conversation once per request: with no cookie this does
+        // an exact-prefix lookup, and every use below must see the same id.
+        var sid = SessionId(ctx, body["messages"] as JsonArray);
         var routes = await Providers.ResolveAsync(model);
         var wantStream = body["stream"]?.GetValue<bool>() ?? false;
 
@@ -315,7 +321,7 @@ public static class Chat
                 Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
                 Providers.NormalizeReasoningEffort(payload, key);
                 HttpResponseMessage resp;
-                try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, SessionId(ctx)); }
+                try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, sid); }
                 catch (Exception e)
                 {
                     lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
@@ -354,11 +360,13 @@ public static class Chat
                         var reply = FirstChoice(content as JsonObject)?["message"]?["content"]?.GetValue<string>() ?? "";
                         TeeTurn(ctx, body["messages"] as JsonArray, reply);
                         if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEcho(content);
-                        SaveSessionFrom(ctx, body["messages"] as JsonArray, model ?? "", reply,
-                            servedModel, key, status,
-                            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0, u, cached,
+                        SaveSessionFrom(ctx, new Sessions.Turn(
+                            model ?? "", servedModel, key,
+                            body["messages"] as JsonArray, reply, status,
+                            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                            new Sessions.Usage(u.Prompt, u.Completion, u.Reasoning, cached),
                             ModelScorerService.Cost(servedModel, u.Prompt,
-                                u.Completion + u.Reasoning, cached));
+                                u.Completion + u.Reasoning, cached)), sid);
                         ModelMetrics.Success(servedModel, u.Prompt, u.Completion + u.Reasoning, cached,
                             ModelScorerService.Cost(servedModel, u.Prompt, u.Completion + u.Reasoning, cached));
                     }
@@ -416,7 +424,7 @@ public static class Chat
                 Providers.NormalizeReasoningEffort(payload, key);
             HttpResponseMessage resp;
             var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, true, SessionId(ctx)); }
+            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, true, sid); }
             catch (Exception e)
             {
                 streamErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";
@@ -468,7 +476,6 @@ public static class Chat
                 // is the model we dictated; OR free legs resolve in-band.
                 ctx.Response.Headers["X-LLM-Model"] = $"{key}:{upstream}";
             }
-            var sid = SessionId(ctx);
             var chunks = new MemoryStream();
             try
             {
@@ -516,12 +523,13 @@ public static class Chat
                     if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEchoFromSse(raw);
                     if (!string.IsNullOrEmpty(sid) && !string.IsNullOrWhiteSpace(reply))
                     {
-                        Sessions.RecordTurn(sid, model ?? "", servedModel, key,
+                        Sessions.RecordTurn(sid, new Sessions.Turn(
+                            model ?? "", servedModel, key,
                             body["messages"] as JsonArray, reply, status,
                             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
                             new Sessions.Usage(u.Prompt, u.Completion, u.Reasoning, cached),
                             ModelScorerService.Cost(servedModel, u.Prompt,
-                                u.Completion + u.Reasoning, cached));
+                                u.Completion + u.Reasoning, cached)));
                     }
                     ModelMetrics.Success(servedModel, u.Prompt, u.Completion + u.Reasoning, cached,
                         ModelScorerService.Cost(servedModel, u.Prompt, u.Completion + u.Reasoning, cached));
@@ -813,7 +821,8 @@ public static class Chat
             Providers.EnsureReasoningEcho(payload["messages"] as JsonArray, Providers.IsThinkingModel(upstream));
                 Providers.NormalizeReasoningEffort(payload, key);
             HttpResponseMessage resp;
-            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false, SessionId(ctx)); }
+            try { (resp, _) = await Providers.UpstreamAsync(key, "/chat/completions", payload, false,
+                SessionId(ctx, body["messages"] as JsonArray)); }
             catch (Exception e)
             {
                 lastErr = $"{Providers.ByKey(key)?.Label} unreachable: {e.GetType().Name}";

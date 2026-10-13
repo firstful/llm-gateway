@@ -64,6 +64,20 @@ public static class Sessions
 
     public sealed record Usage(long Prompt, long Completion, long Reasoning, long Cached);
 
+/// <summary>One model invocation and everything worth remembering about it.
+    /// A record rather than a parameter list -- these are same-typed longs and
+    /// strings, and positional arguments here are easy to transpose silently.</summary>
+public sealed record Turn(
+    string RequestedModel,
+    string ServedModel,
+    string Provider,
+    JsonArray? Messages,
+    string? Reply,
+    int Status,
+    long LatencyMs,
+    Usage Tokens,
+    double Usd);
+
     static SqliteConnection Open()
     {
         var conn = new SqliteConnection($"Data Source={Env.SessionDb}");
@@ -103,6 +117,7 @@ public static class Sessions
                     id TEXT PRIMARY KEY,
                     model TEXT NOT NULL DEFAULT 'auto',
                     turns INTEGER NOT NULL DEFAULT 0,
+                    first_key TEXT,                 -- hash of opening message
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -131,6 +146,34 @@ public static class Sessions
                 CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at);
                 """;
             cmd.ExecuteNonQuery();
+
+            // Backfill first_key for databases predating it. This must run after
+            // CREATE TABLE: on a fresh database the table does not exist yet and
+            // ALTER TABLE fails outright.
+            using (var cols = conn.CreateCommand())
+            {
+                // PRAGMA table_info's result is (cid, name, type, ...), so the
+                // column being asked about is the *value* at ordinal 1 --
+                // GetName(1) would only return the header "name".
+                cols.CommandText = "PRAGMA table_info(conversations)";
+                var hasKey = false;
+                using (var r = cols.ExecuteReader())
+                    while (r.Read())
+                        if (r.GetString(1).Equals("first_key", StringComparison.OrdinalIgnoreCase))
+                            hasKey = true;
+                if (!hasKey)
+                {
+                    using var alter = conn.CreateCommand();
+                    alter.CommandText = "ALTER TABLE conversations ADD COLUMN first_key TEXT";
+                    alter.ExecuteNonQuery();
+                }
+            }
+            using (var ix = conn.CreateCommand())
+            {
+                ix.CommandText =
+                    "CREATE INDEX IF NOT EXISTS idx_conv_firstkey ON conversations(first_key, updated_at)";
+                ix.ExecuteNonQuery();
+            }
         }
     }
 
@@ -147,8 +190,7 @@ public static class Sessions
     static (JsonArray Delta, bool Diverged) PromptDelta(SqliteConnection conn, string sid,
         JsonArray? full)
     {
-        var delta = new JsonArray();
-        if (full is null) return (delta, false);
+        if (full is null) return (new JsonArray(), false);
 
         var stored = new List<string>();
         using (var q = conn.CreateCommand())
@@ -166,21 +208,50 @@ public static class Sessions
                 catch { }
             }
         }
-        if (stored.Count == 0) return (CloneUserMessages(full), false);
+
+        // Compare like with like. What we store never contains assistant
+        // messages, so aligning the incoming array against the stored sequence
+        // *including* its assistant entries misaligns the two the moment a
+        // reply sits between two user messages: the comparison falls out at the
+        // reply, and every user message after it is re-stored as new. Over a
+        // long session that duplicates the conversation and leaves the stored
+        // sequence permanently longer than any real continuation, so no future
+        // turn can ever match it.
+        var inc = NonAssistant(full);
+
+        if (stored.Count == 0) return (AsArray(inc), false);
 
         // Longest common prefix between what we hold and what arrived.
         int lcp = 0;
-        int n = Math.Min(stored.Count, full.Count);
-        while (lcp < n && stored[lcp] == Key(full[lcp])) lcp++;
-        bool diverged = lcp < stored.Count || lcp == 0 && full.Count > 0 && stored.Count > 0;
+        int n = Math.Min(stored.Count, inc.Count);
+        while (lcp < n && stored[lcp] == Key(inc[lcp])) lcp++;
+        bool diverged = lcp < stored.Count;
 
-        for (int i = lcp; i < full.Count; i++)
-        {
-            var m = full[i];
-            if (m is JsonObject o && o["role"]?.GetValue<string>() == "assistant") continue;
-            delta.Add(m?.DeepClone());
-        }
+        var delta = new JsonArray();
+        for (int i = lcp; i < inc.Count; i++) delta.Add(inc[i]?.DeepClone());
         return (delta, diverged);
+    }
+
+    /// <summary>The non-assistant messages of an array, in order. Both the
+    /// stored prompts and the incoming request are reduced through this, which
+    /// is what keeps them aligned.</summary>
+    static List<JsonNode?> NonAssistant(JsonArray? messages)
+    {
+        var seq = new List<JsonNode?>();
+        if (messages is null) return seq;
+        foreach (var m in messages)
+        {
+            if (m is JsonObject o && o["role"]?.GetValue<string>() == "assistant") continue;
+            seq.Add(m);
+        }
+        return seq;
+    }
+
+    static JsonArray AsArray(List<JsonNode?> items)
+    {
+        var a = new JsonArray();
+        foreach (var i in items) a.Add(i?.DeepClone());
+        return a;
     }
 
     static string Key(JsonNode? m)
@@ -191,21 +262,122 @@ public static class Sessions
         return role + "\u0001" + content;
     }
 
-    static JsonArray CloneUserMessages(JsonArray full)
+
+    /// <summary>Sequence of non-assistant messages, as comparable keys.
+    ///
+    /// Only user/tool messages are kept, matching what <see cref="PromptDelta"/>
+    /// stores, so the two can be compared directly.</summary>
+    static List<string> UserSeq(JsonArray? messages)
     {
-        var d = new JsonArray();
-        foreach (var m in full)
-        {
-            if (m is JsonObject o && o["role"]?.GetValue<string>() == "assistant") continue;
-            d.Add(m?.DeepClone());
-        }
-        return d;
+        var seq = new List<string>();
+        foreach (var m in NonAssistant(messages)) seq.Add(Key(m));
+        return seq;
     }
 
-    public static void RecordTurn(string sid, string requestedModel, string servedModel,
-        string provider, JsonArray? messages, string? reply, int status, long latencyMs,
-        Usage usage, double usd)
+    /// <summary>Stable key for a conversation's opening message. A running
+    /// session's first message is its system/identity header and never changes,
+    /// which makes it an exact lookup key rather than something fuzzy.</summary>
+    static string FirstKey(JsonArray? messages)
     {
+        var seq = UserSeq(messages);
+        return seq.Count == 0 ? "" : Hash(seq[0]);
+    }
+
+    static string Hash(string s)
+    {
+        // FNV-1a: stable across restarts, unlike string.GetHashCode.
+        ulong h = 14695981039346656037UL;
+        foreach (var c in s) { h ^= c; h *= 1099511628211UL; }
+        return h.ToString("x16");
+    }
+
+    /// <summary>Shared prefix we will accept as evidence of continuation.</summary>
+    const int MinShared = 2;
+
+    /// <summary>Find the conversation this request continues.
+    ///
+    /// A running session only ever appends, so the messages already stored for
+    /// it are an *exact* prefix of what just arrived -- no similarity scoring is
+    /// needed and none is used.
+    ///
+    /// The shared prefix must reach <see cref="MinShared"/> messages. Many
+    /// conversations legitimately open with the same agent system header, and
+    /// matching on one message would merge unrelated sessions wholesale.
+    ///
+    /// A client that rewrites its own history is out of scope here: there is no
+    /// shared prefix left to find, and only its cookie can recover that case.
+    ///
+    /// Without this, every request without a cookie got a fresh random GUID and
+    /// one long conversation fragmented into dozens of single-turn ones with no
+    /// way to relate them.</summary>
+    public static string? FindByPrefix(JsonArray? messages, int maxCandidates = 32)
+    {
+        var inc = UserSeq(messages);
+        if (inc.Count == 0) return null;
+        var key = Hash(inc[0]);
+        string? best = null;
+        var bestShared = 0;
+        try
+        {
+            lock (Lock)
+            {
+                using var conn = Open();
+                var candidates = new List<string>();
+                using (var q = conn.CreateCommand())
+                {
+                    q.CommandText =
+                        "SELECT id FROM conversations WHERE first_key = @k ORDER BY updated_at DESC LIMIT @n";
+                    q.Parameters.AddWithValue("@k", key);
+                    q.Parameters.AddWithValue("@n", maxCandidates);
+                    using var r = q.ExecuteReader();
+                    while (r.Read()) candidates.Add(r.GetString(0));
+                }
+                foreach (var cid in candidates)
+                {
+                    var stored = StoredSeq(conn, cid);
+                    if (stored.Count == 0) continue;
+                    if (stored.Count > inc.Count) continue;
+                    if (!stored.SequenceEqual(inc.Take(stored.Count))) continue;
+                    if (stored.Count > bestShared) { bestShared = stored.Count; best = cid; }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            if (Debug) Console.Error.WriteLine($"[sessions/prefix] {e.GetType().Name}: {e.Message}");
+        }
+        return best;
+    }
+
+    static List<string> StoredSeq(SqliteConnection conn, string cid)
+    {
+        var seq = new List<string>();
+        using var t = conn.CreateCommand();
+        t.CommandText = "SELECT prompt FROM turns WHERE conv_id = @id ORDER BY seq";
+        t.Parameters.AddWithValue("@id", cid);
+        using var r = t.ExecuteReader();
+        while (r.Read())
+        {
+            try
+            {
+                if (JsonNode.Parse(r.GetString(0)) is JsonArray pa)
+                    foreach (var m in pa)
+                    {
+                        if (m is JsonObject o && o["role"]?.GetValue<string>() == "assistant") continue;
+                        seq.Add(Key(m));
+                    }
+            }
+            catch { }
+        }
+        return seq;
+    }
+
+    public static void RecordTurn(string sid, Turn turn)
+    {
+        var (requestedModel, servedModel, provider) =
+            (turn.RequestedModel, turn.ServedModel, turn.Provider);
+        var (messages, reply, status, latencyMs, usage, usd) =
+            (turn.Messages, turn.Reply, turn.Status, turn.LatencyMs, turn.Tokens, turn.Usd);
         if (string.IsNullOrEmpty(sid)) return;
         try
         {
@@ -278,14 +450,16 @@ public static class Sessions
                 using (var up = conn.CreateCommand())
                 {
                     up.CommandText = """
-                        INSERT INTO conversations (id, model, turns, created_at, updated_at)
-                        VALUES (@id, @model, 1, @ts, @ts)
+                        INSERT INTO conversations (id, model, turns, first_key, created_at, updated_at)
+                        VALUES (@id, @model, 1, @key, @ts, @ts)
                         ON CONFLICT(id) DO UPDATE SET
                             turns = turns + 1,
+                            first_key = COALESCE(conversations.first_key, excluded.first_key),
                             updated_at = excluded.updated_at
                         """;
                     up.Parameters.AddWithValue("@id", sid);
                     up.Parameters.AddWithValue("@model", requestedModel);
+                    up.Parameters.AddWithValue("@key", FirstKey(messages));
                     up.Parameters.AddWithValue("@ts", now);
                     up.ExecuteNonQuery();
                 }
