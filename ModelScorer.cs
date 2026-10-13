@@ -67,6 +67,50 @@ public static class ModelMetrics
 /// long-context tier or a peak multiplier, and silently reported the wrong
 /// one. models.opencode.ai/api.json publishes cost including context tiers.
 /// </summary>
+/// <summary>
+/// Keeps the session store inside its size budget.
+///
+/// Deliberately not done inline on save: pruning mid-request blocks the caller,
+/// and VACUUM needs exclusive access to the database, which cannot be had while
+/// requests are writing. This waits for the store to go idle, then compacts
+/// in-process.
+/// </summary>
+public sealed class SessionPrunerService : BackgroundService
+{
+    const int PollSeconds = 60;
+    const double IdleRequiredSeconds = 20;   // only VACUUM on a quiet store
+
+    protected override async Task ExecuteAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var (_, bytes, _) = Sessions.Size();
+                var cap = (long)Env.SessionDbMaxMb * 1024 * 1024;
+                if (cap > 0 && bytes > cap)
+                {
+                    // Wait for writers to finish rather than yanking the file
+                    // out from under them.
+                    while (!ct.IsCancellationRequested && Sessions.IdleSeconds < IdleRequiredSeconds)
+                        await Task.Delay(2000, ct);
+                    if (!ct.IsCancellationRequested)
+                    {
+                        var (conv, before, after) = Sessions.Prune();
+                        if (before != after)
+                            Console.WriteLine(
+                                $"[sessions] pruned {conv} conversations: " +
+                                $"{before / 1024 / 1024}MB -> {after / 1024 / 1024}MB");
+                    }
+                }
+                await Task.Delay(TimeSpan.FromSeconds(PollSeconds), ct);
+            }
+            catch (OperationCanceledException) { return; }
+            catch { await Task.Delay(TimeSpan.FromSeconds(PollSeconds), ct); }
+        }
+    }
+}
+
 public sealed class ModelScorerService : BackgroundService
 {
     const string ApiJson = "https://models.opencode.ai/api.json";

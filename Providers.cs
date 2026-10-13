@@ -78,6 +78,10 @@ public static class Env
     public static string SessionDb { get; } = EnvOr("SESSION_DB", "/data/sessions.db");
     public const string SessionCookie = "llm_session";
     public static int SessionTtlDays { get; } = IntOr("SESSION_TTL_DAYS", 30);
+    // Rolling-buffer cap on the session store. The blob-per-session layout grew
+    // to 3.4 GB on a box with 3.4 GiB RAM; oldest sessions are dropped wholesale
+    // once the file crosses this, and space is returned to the OS.
+    public static int SessionDbMaxMb { get; } = IntOr("SESSION_DB_MAX_MB", 1024);
 
     // Live local-LLM status cache (v1.7.0) — proxy llama-ctrl /status, cached 5s.
     public static string LocalCtrlUrl { get; } = EnvOr("LOCAL_CTRL_URL", "http://llama-ctrl.llama.svc.cluster.local").TrimEnd('/');

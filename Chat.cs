@@ -44,16 +44,20 @@ public static class Chat
         return sid;
     }
 
+    /// <summary>Persist one turn: what was asked, what answered, which model
+    /// actually served it, and when. Only the user messages this turn
+    /// introduced are stored, so the write is proportional to the delta rather
+    /// than to the whole conversation.</summary>
     static void SaveSessionFrom(HttpContext ctx, JsonArray? messages, string model, string reply,
-        string? served = null)
+        string served, string provider, int status, long latencyMs,
+        Stats.Usage usage, int cached, double usd)
     {
         var sid = SessionId(ctx);
         if (string.IsNullOrEmpty(sid) || string.IsNullOrWhiteSpace(reply)) return;
-        var msgs = new JsonArray();
-        if (messages is not null)
-            foreach (var m in messages) msgs.Add(m?.DeepClone());
-        msgs.Add(new JsonObject { ["role"] = "assistant", ["content"] = reply });
-        Sessions.Save(sid, msgs, model, served);
+        var sid2 = sid;
+        Sessions.RecordTurn(sid2, model, served, provider, messages, reply,
+            status, latencyMs,
+            new Sessions.Usage(usage.Prompt, usage.Completion, usage.Reasoning, cached), usd);
     }
 
     static void TeeTurn(HttpContext ctx, JsonArray? messages, string reply)
@@ -350,7 +354,11 @@ public static class Chat
                         var reply = FirstChoice(content as JsonObject)?["message"]?["content"]?.GetValue<string>() ?? "";
                         TeeTurn(ctx, body["messages"] as JsonArray, reply);
                         if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEcho(content);
-                        SaveSessionFrom(ctx, body["messages"] as JsonArray, model ?? "", reply, servedModel);
+                        SaveSessionFrom(ctx, body["messages"] as JsonArray, model ?? "", reply,
+                            servedModel, key, status,
+                            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0, u, cached,
+                            ModelScorerService.Cost(servedModel, u.Prompt,
+                                u.Completion + u.Reasoning, cached));
                         ModelMetrics.Success(servedModel, u.Prompt, u.Completion + u.Reasoning, cached,
                             ModelScorerService.Cost(servedModel, u.Prompt, u.Completion + u.Reasoning, cached));
                     }
@@ -508,11 +516,12 @@ public static class Chat
                     if (Providers.IsThinkingModel(upstream)) Providers.CacheReasoningEchoFromSse(raw);
                     if (!string.IsNullOrEmpty(sid) && !string.IsNullOrWhiteSpace(reply))
                     {
-                        var msgs = new JsonArray();
-                        if (body["messages"] is JsonArray orig)
-                            foreach (var m in orig) msgs.Add(m?.DeepClone());
-                        msgs.Add(new JsonObject { ["role"] = "assistant", ["content"] = reply });
-                        Sessions.Save(sid, msgs, model ?? "", servedModel);
+                        Sessions.RecordTurn(sid, model ?? "", servedModel, key,
+                            body["messages"] as JsonArray, reply, status,
+                            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t0,
+                            new Sessions.Usage(u.Prompt, u.Completion, u.Reasoning, cached),
+                            ModelScorerService.Cost(servedModel, u.Prompt,
+                                u.Completion + u.Reasoning, cached));
                     }
                     ModelMetrics.Success(servedModel, u.Prompt, u.Completion + u.Reasoning, cached,
                         ModelScorerService.Cost(servedModel, u.Prompt, u.Completion + u.Reasoning, cached));

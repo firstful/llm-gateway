@@ -6,6 +6,7 @@ builder.Logging.SetMinimumLevel(LogLevel.Warning);
 builder.Services.AddHostedService<LiveFlusherService>();
 builder.Services.AddHostedService<StatsFlusherService>();
 builder.Services.AddHostedService<ModelScorerService>();
+builder.Services.AddHostedService<SessionPrunerService>();
 
 // PORT env parity with the Python version (ASPNETCORE_URLS wins if set)
 var port = Environment.GetEnvironmentVariable("PORT");
@@ -159,12 +160,15 @@ app.MapGet("/v1/session", (HttpContext ctx) =>
         return Results.Json(data);
     }
     var loaded = Sessions.Load(sid);
-    var (messages, model) = loaded is { } t ? (t.Messages ?? new JsonArray(), t.Model) : (new JsonArray(), "auto");
+    var (messages, model, served) = loaded is { } t
+        ? (t.Messages ?? new JsonArray(), t.Model, t.Served)
+        : (new JsonArray(), "auto", (string?)null);
     return Results.Json(new JsonObject
     {
         ["id"] = sid,
         ["messages"] = messages,
         ["model"] = model,
+        ["served"] = served,
         ["new"] = false,
     });
 });
