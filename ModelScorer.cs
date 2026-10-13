@@ -286,7 +286,11 @@ public sealed class ModelScorerService : BackgroundService
 
         var obs = ModelMetrics.All();
         var rows = new List<Scored>();
-        foreach (var rate in _state.Rates)
+        // Iterate the state being built, not _state: _state is only republished at
+        // the end of Refresh, so reading it here would score against the
+        // previous pass -- which on startup means no roster at all and an
+        // empty ordering until the next tick.
+        foreach (var rate in st.Rates)
         {
             if (live.Count > 0 && !live.Contains(rate.Model)) continue;
             if (Blacklist.IsMatch(rate.Model)) continue;
