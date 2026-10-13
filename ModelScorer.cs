@@ -173,10 +173,11 @@ public sealed class SessionPrunerService : BackgroundService
                                 $"[sessions] pruned {conv} conversations: " +
                                 $"{before / 1024 / 1024}MB -> {after / 1024 / 1024}MB");
                     }
-                    // Flush counters on the same tick: cheap, and it bounds how
-                    // much observation history a crash or deploy can lose.
-                    MetricsStore.Flush();
                 }
+                // Flush on every tick, not only when over the cap: this bounds
+                // how much observation history a crash or deploy can lose, and
+                // losing it resets every model's reliability to its prior.
+                MetricsStore.Flush();
                 await Task.Delay(TimeSpan.FromSeconds(PollSeconds), ct);
             }
             catch (OperationCanceledException) { return; }
