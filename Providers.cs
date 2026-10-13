@@ -57,6 +57,15 @@ public static class Env
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
+    // Operator model pin (see ModelPin). The pin file sits beside the session
+    // store so a pin survives a service restart but still expires on its TTL.
+    public static string PinFile { get; } = EnvOr("PIN_FILE", "/data/model-pin.json");
+    // Guards the admin endpoints that change routing. Deliberately NOT optional:
+    // if it is unset those endpoints refuse to run rather than defaulting open,
+    // because an unauthenticated endpoint that repoints every LLM request on
+    // the LAN is a real privilege, not a convenience.
+    public static string AdminToken { get; } = EnvOr("ADMIN_TOKEN", "");
+
     // RAG injection (v1.2.0) — header-driven control plane:
     //   X-Consumer: <id>       scope session embeddings to this consumer
     //   X-RAG-Docs: 1|0        include docs source (default on)
@@ -333,6 +342,16 @@ public static class Providers
         return probe;
     }
 
+    /// <summary>The scorer's ranked chain for an alias, best first. Empty when
+    /// the background scorer has not completed its first pass yet.</summary>
+    static List<(string Key, string Upstream)> Ranked(string low)
+    {
+        var ranked = ModelScorerService.Current;
+        if (ranked.Length == 0) return new List<(string, string)>();
+        var picks = low == "free" ? Array.FindAll(ranked, ModelScorerService.IsFree) : ranked;
+        return picks.Select(m => (Key: "ocg", Upstream: m)).ToList();
+    }
+
     /// <summary>Ordered (provider_key, upstream_model) chain for a model name.</summary>
     public static async Task<List<(string Key, string Upstream)>> ResolveAsync(string? model)
     {
@@ -343,18 +362,26 @@ public static class Providers
 
         if (low == "auto" || low == "free")
         {
+            // An operator pin wins over the scorer, and is strict by default so
+            // that a failure surfaces instead of being papered over by a
+            // fall-through to the model we were trying not to use.
+            var pin = ModelPin.Active;
+            if (pin is not null)
+            {
+                var pinned = new List<(string, string)> { ("ocg", pin.Model) };
+                if (pin.Fallback)
+                {
+                    foreach (var r in Ranked(low))
+                        if (!pinned.Any(c => c.Item2 == r.Upstream)) pinned.Add(r);
+                }
+                return pinned;
+            }
+
             // The scorer owns the ranked list; the serving path is a dumb
             // executor that walks it top-to-bottom until one model works.
             // OpenCode Go only -- OpenRouter and OpenCode Zen were dropped.
-            var ranked = ModelScorerService.Current;
-            if (ranked.Length > 0)
-            {
-                var picks = low == "free"
-                    ? Array.FindAll(ranked, ModelScorerService.IsFree)
-                    : ranked;
-                if (picks.Length > 0)
-                    return picks.Select(m => (Key: "ocg", Upstream: m)).ToList();
-            }
+            var ranked = Ranked(low);
+            if (ranked.Count > 0) return ranked;
 
             // Cold start: the background scorer has not completed its first
             // pass yet. Serve from the configured chain rather than handing

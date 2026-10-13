@@ -40,6 +40,7 @@ app.Use(async (ctx, next) =>
 
 Sessions.Init();
 MetricsStore.Load();
+ModelPin.Load();
 var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
 var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
 
@@ -56,6 +57,7 @@ app.MapGet("/health", () => new JsonObject
     ["providers"] = new JsonArray(Providers.All.Select(p => (JsonNode)p.Key).ToArray()),
     ["rag"] = new JsonObject { ["enabled"] = Env.RagEnabled, ["base_url"] = Env.RagBaseUrl },
     ["live_ingest"] = new JsonObject { ["enabled"] = Env.LiveIngestEnabled, ["queued"] = Rag.LiveQueue.Reader.Count },
+    ["pin"] = ModelPin.Describe(),
 });
 
 // ---------------- request statistics ----------------
@@ -129,6 +131,7 @@ app.MapGet("/status.json", async () =>
                 ? null : ModelScorerService.LastOk.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"),
             ["last_error"] = ModelScorerService.LastError == "" ? null : ModelScorerService.LastError,
             ["cost_weight"] = ModelScorerService.CostWeight,
+            ["pin"] = ModelPin.Describe(),
             ["quota"] = ModelScorerService.Quota?["usage"]?.DeepClone(),
             ["order"] = new JsonArray(ModelScorerService.Current.Select(m => (JsonNode)m!).ToArray()),
             ["models"] = ModelScorerService.Describe(),
@@ -142,6 +145,60 @@ app.MapGet("/status.json", async () =>
         },
     });
 });
+
+// ---------------- operator model pin ----------------
+// Swap the model `auto`/`free` resolves to, to A/B one against another without
+// editing .env and restarting. Always TTL'd: a pin left on becomes the
+// permanent configuration by accident, which is the failure this avoids.
+app.MapGet("/admin/model", () => Results.Json(ModelPin.Describe()));
+
+app.MapPost("/admin/model", async (HttpContext ctx) =>
+{
+    if (!AdminOk(ctx)) return Results.Json(AdminDenied(), statusCode: 503);
+
+    JsonObject? body;
+    try { body = await JsonNode.ParseAsync(ctx.Request.Body) as JsonObject; }
+    catch (Exception e) { return Results.Json(new JsonObject { ["error"] = $"invalid JSON body: {e.Message}" }, statusCode: 400); }
+    if (body is null) return Results.Json(new JsonObject { ["error"] = "a JSON body is required" }, statusCode: 400);
+
+    var model = body["model"]?.GetValue<string>() ?? "";
+    var fallback = body["fallback"]?.GetValue<bool>() ?? false;
+    // 0 means "use the default"; negative or absurd values are clamped in Set.
+    var ttl = body["ttl_s"] is { } t && t.GetValueKind() != System.Text.Json.JsonValueKind.Null
+        ? t.GetValue<int>() : ModelPin.DefaultTtlSeconds;
+
+    var (ok, message, state) = ModelPin.Set(model, fallback, ttl);
+    if (!ok) { state["error"] = message; state["ok"] = false; return Results.Json(state, statusCode: 400); }
+    state["ok"] = true;
+    state["message"] = message;
+    return Results.Json(state);
+});
+
+app.MapDelete("/admin/model", (HttpContext ctx) =>
+{
+    if (!AdminOk(ctx)) return Results.Json(AdminDenied(), statusCode: 503);
+    var (ok, message, state) = ModelPin.Clear();
+    state["ok"] = ok;
+    state["message"] = message;
+    return Results.Json(state);
+});
+
+// ADMIN_TOKEN gates every mutating admin call. Unset means the endpoints
+// refuse rather than default open -- repointing all LLM traffic is a
+// privilege, and the token is one line in .env.
+static bool AdminOk(HttpContext ctx)
+{
+    if (string.IsNullOrEmpty(Env.AdminToken)) return false;
+    var supplied = ctx.Request.Headers.Authorization.ToString();
+    if (!supplied.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
+    return supplied["Bearer ".Length..].Trim() == Env.AdminToken;
+}
+
+static JsonObject AdminDenied() => new()
+{
+    ["error"] = "admin endpoints require ADMIN_TOKEN to be set in /opt/llm-gateway/.env",
+    ["hint"] = "add ADMIN_TOKEN=<anything> and restart llm-gateway, then send: Authorization: Bearer <token>",
+};
 
 // ---------------- chat sessions (cookie-keyed, v1.7.0) ----------------
 app.MapGet("/v1/session", (HttpContext ctx) =>
