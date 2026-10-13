@@ -81,6 +81,12 @@ public sealed class ModelScorerService : BackgroundService
     const double CostWeightBase = 0.25;   // quota comfortable
     const double CostWeightMax = 0.75;    // quota nearly exhausted
 
+    // Quality/UX weights. Reliability dominates by design: a model that does
+    // not answer is worse than a mediocre one that does.
+    const double QualityWeight = 0.30;    // external prior, cold start only
+    const double UxWeight = 0.10;         // time-to-first-token
+    const double QualityTtlMinutes = 360; // 6h; these indexes move slowly
+
     sealed class Rate
     {
         public string Model = "";
@@ -95,6 +101,9 @@ public sealed class ModelScorerService : BackgroundService
         public bool Free;
         public long N, Ok, Fail;
         public double Reliability, UsdPerReq, Score;
+        public double Quality = 0.5, QualityConf = 0, Ux = 0.5;
+        public double TtftMs = -1;
+        public int QualitySources;
     }
 
     /// <summary>Immutable scorer state, published as a single reference so
@@ -108,6 +117,8 @@ public sealed class ModelScorerService : BackgroundService
         public double CostWeight;
         public DateTimeOffset LastOk = DateTimeOffset.MinValue;
         public string LastError = "";
+        public Dictionary<string, QualitySources.Entry> Quality = new();
+        public DateTimeOffset QualityFetched = DateTimeOffset.MinValue;
     }
 
     static volatile State _state = new();
@@ -206,6 +217,7 @@ public sealed class ModelScorerService : BackgroundService
         if (roster.Length == 0)
             throw new InvalidOperationException("api.json returned no opencode-go models");
         var st = new State { Rates = roster.Select(r => r.Rate).ToArray() };
+        st.Quality = await QualityFor(st.Rates.Select(r => r.Model).ToArray(), st, ct);
 
         var ocg = Providers.ByKey("ocg");
         var served = await Providers.ProviderModelsAsync("ocg");
@@ -250,6 +262,7 @@ public sealed class ModelScorerService : BackgroundService
                 perReq = (mp * rate.Input + mk * rate.CacheRead + mc * rate.Output) / 1e6;
             }
 
+            var qe = st.Quality.GetValueOrDefault(rate.Model);
             rows.Add(new Scored
             {
                 Model = rate.Model,
@@ -259,6 +272,11 @@ public sealed class ModelScorerService : BackgroundService
                 Fail = fail,
                 Reliability = rel,
                 UsdPerReq = perReq,
+                Quality = qe?.Quality ?? 0.5,
+                QualityConf = qe?.Confidence ?? 0,
+                Ux = qe?.Ux ?? 0.5,
+                QualitySources = qe?.Sources ?? 0,
+                TtftMs = qe?.TtftMs ?? -1,
             });
         }
 
@@ -271,7 +289,15 @@ public sealed class ModelScorerService : BackgroundService
         foreach (var r in viable)
         {
             double cheap = r.Free ? 1.0 : Math.Max(0.0, 1.0 - r.UsdPerReq / refCost);
-            r.Score = (1 - st.CostWeight) * r.Reliability + st.CostWeight * cheap;
+            double baseScore = (1 - st.CostWeight) * r.Reliability + st.CostWeight * cheap;
+
+            // External priors only apply where data exists. Weight is scaled by
+            // evidence and the remainder given back to the observed terms, so a
+            // model with no benchmark data is not silently penalised for it.
+            double wQ = QualityWeight * r.QualityConf;
+            double wU = r.TtftMs >= 0 ? UxWeight : 0.0;
+            double wR = Math.Max(0.0, 1.0 - wQ - wU);
+            r.Score = wR * baseScore + wQ * r.Quality + wU * r.Ux;
         }
 
         // free tier is a separate pool (flat daily cap, no USD windows) so it
@@ -284,6 +310,31 @@ public sealed class ModelScorerService : BackgroundService
         st.LastOk = DateTimeOffset.UtcNow;
         st.LastError = "";
         _state = st;
+    }
+
+    /// <summary>Fetch external quality signals on a slow TTL. These indexes move
+    /// on the order of days, so refetching every ranking pass (5 min) would be
+    /// pure waste and rude to the providers. Fail-open: any source error just
+    /// yields fewer signals, never a failed refresh.</summary>
+    async Task<Dictionary<string, QualitySources.Entry>> QualityFor(
+        string[] roster, State st, CancellationToken ct)
+    {
+        var prev = _state.Quality;
+        if (prev.Count > 0 &&
+            DateTimeOffset.UtcNow - _state.QualityFetched <
+                TimeSpan.FromMinutes(QualityTtlMinutes))
+            return prev;
+        try
+        {
+            var fresh = await QualitySources.Fetch(roster, ct);
+            st.QualityFetched = DateTimeOffset.UtcNow;
+            return fresh.ToDictionary(k => k.Key, v => v.Value);
+        }
+        catch (Exception e)
+        {
+            st.LastError = "quality: " + e.GetType().Name;
+            return prev;
+        }
     }
 
     static long Median(IEnumerable<long> xs)
@@ -313,6 +364,10 @@ public sealed class ModelScorerService : BackgroundService
                 ["fail"] = fail,
                 ["rate_limited"] = s?.RateLimited ?? 0,
                 ["reliability"] = Math.Round(rel, 4),
+                ["quality"] = _state.Quality.TryGetValue(m, out var qe) ? qe.Quality : null,
+                ["quality_conf"] = qe?.Confidence,
+                ["quality_sources"] = qe?.Sources ?? 0,
+                ["ttft_ms"] = qe != null && qe.TtftMs >= 0 ? qe.TtftMs : null,
                 ["est_usd_per_req"] = rate is null
                     ? null
                     : Math.Round((s?.Reqs ?? 0) >= 10 ? s!.Usd / s.Reqs : Cost(m, 0, 0, 0), 8),
