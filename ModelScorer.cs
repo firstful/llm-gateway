@@ -77,15 +77,14 @@ public sealed class ModelScorerService : BackgroundService
     const int RefreshMinutes = 5;
     const int MinReliabilitySample = 40;
     const double ReliabilityPrior = 0.90;
-    const double MinReliability = 0.75;   // below this a leg wastes a round trip
-    const double CostWeightBase = 0.25;   // quota comfortable
-    const double CostWeightMax = 0.75;    // quota nearly exhausted
 
-    // Quality/UX weights. Reliability dominates by design: a model that does
-    // not answer is worse than a mediocre one that does.
-    const double QualityWeight = 0.30;    // external prior, cold start only
-    const double UxWeight = 0.10;         // time-to-first-token
-    const double QualityTtlMinutes = 360; // 6h; these indexes move slowly
+    // Gates and tiers -- see the ranking block in Refresh().
+    const double GateReliability = 0.90;  // observed success floor to stay in tier
+    const double FastTtftMs = 600;         // speed gate; unknown is "unproven"
+    const double MinReliability = 0.75;   // hard floor, below this it is noise
+    const double CostWeightBase = 0.25;   // quota comfortable (still reported)
+    const double CostWeightMax = 0.75;    // quota nearly exhausted
+    const int QualityTtlMinutes = 360;    // 6h; these indexes move slowly
 
     sealed class Rate
     {
@@ -104,6 +103,8 @@ public sealed class ModelScorerService : BackgroundService
         public double Quality = 0.5, QualityConf = 0, Ux = 0.5;
         public double TtftMs = -1;
         public int QualitySources;
+        public int Tier;              // 0 free, 1 paid+benchmarked, 2 paid+unknown
+        public bool Benchmarked, FastOk, ReliableOk;
     }
 
     /// <summary>Immutable scorer state, published as a single reference so
@@ -280,31 +281,64 @@ public sealed class ModelScorerService : BackgroundService
             });
         }
 
-        var viable = rows.Where(r => r.Reliability >= MinReliability).ToList();
-        if (viable.Count == 0) viable = rows;   // never emit an empty list
-
-        double refCost = viable.Where(r => !r.Free && r.UsdPerReq > 0)
-                               .Select(r => r.UsdPerReq).DefaultIfEmpty(0).Max();
-        if (refCost <= 0) refCost = 1e-9;
-        foreach (var r in viable)
+        // ---------------------------------------------------------------------
+        // Ranking is rules, not a weighted blend.
+        //
+        //   Tier 0  free                    unknown quality is acceptable:
+        //                                     a wrong guess costs quality only
+        //   Tier 1  paid, benchmarked       preferred when spending money
+        //   Tier 2  paid, unbenchmarked     last resort -- a wrong guess here
+        //                                     costs quality AND money
+        //
+        // Gates: a model must be reliable (and fast where we can tell) to stay
+        // in its tier. Falling out of the gates demotes it.
+        //
+        // Quality benchmarks therefore only arbitrate Tier 1 -- choosing what to
+        // spend on -- which is the only place they earn their keep. Using them to
+        // rank free models would be noise: 78% coverage, and the uncovered 22%
+        // are precisely the free models we actually serve.
+        // ---------------------------------------------------------------------
+        var tiered = new List<Scored>();
+        foreach (var r in rows)
         {
-            double cheap = r.Free ? 1.0 : Math.Max(0.0, 1.0 - r.UsdPerReq / refCost);
-            double baseScore = (1 - st.CostWeight) * r.Reliability + st.CostWeight * cheap;
-
-            // External priors only apply where data exists. Weight is scaled by
-            // evidence and the remainder given back to the observed terms, so a
-            // model with no benchmark data is not silently penalised for it.
-            double wQ = QualityWeight * r.QualityConf;
-            double wU = r.TtftMs >= 0 ? UxWeight : 0.0;
-            double wR = Math.Max(0.0, 1.0 - wQ - wU);
-            r.Score = wR * baseScore + wQ * r.Quality + wU * r.Ux;
+            bool benchmarked = r.QualityConf > 0;
+            r.Tier = r.Free ? 0 : (benchmarked ? 1 : 2);
+            r.Benchmarked = benchmarked;
+            r.FastOk = r.TtftMs < 0 || r.TtftMs <= FastTtftMs;   // unknown = unproven, not failed
+            r.ReliableOk = r.Reliability >= GateReliability;
+            r.Score = r.Tier switch
+            {
+                // free: reliability dominates, speed breaks ties
+                0 => r.Reliability * 0.85 + (r.TtftMs < 0 ? 0.05 : Math.Clamp(1.0 - r.TtftMs / (FastTtftMs * 2.0), 0.0, 0.15)),
+                // paid + benchmarked: quality is half the decision, because we
+                // are spending real money and benchmarks are all we have. Price
+                // is blended in by quota pressure -- as the monthly allowance
+                // tightens, cheaper models rise within the paid tier.
+                1 => (1 - st.CostWeight) * (0.5 * r.Reliability + 0.5 * r.Quality)
+                     + st.CostWeight * (r.UsdPerReq <= 0 ? 0.5
+                        : Math.Max(0.0, 1.0 - r.UsdPerReq / PaidRefCost(tiered))),
+                // paid + unknown quality: reliability, plus the same price tilt
+                _ => (1 - st.CostWeight) * r.Reliability
+                     + st.CostWeight * (r.UsdPerReq <= 0 ? 0.5
+                        : Math.Max(0.0, 1.0 - r.UsdPerReq / PaidRefCost(tiered))),
+            };
+            tiered.Add(r);
         }
 
-        // free tier is a separate pool (flat daily cap, no USD windows) so it
-        // leads; within each pool, score order.
-        viable.Sort((a, b) => a.Free != b.Free
-            ? (a.Free ? -1 : 1)
-            : b.Score.CompareTo(a.Score));
+        // Never emit an empty or all-gated-out list: if everything fails the
+        // gates, fall back to the full set ordered by tier and score.
+        var viable = tiered.Where(r => r.ReliableOk && r.FastOk).ToList();
+        if (viable.Count == 0) viable = tiered;
+
+        viable.Sort((a, b) =>
+        {
+            int c = a.Tier.CompareTo(b.Tier);
+            if (c != 0) return c;
+            c = b.Score.CompareTo(a.Score);
+            if (c != 0) return c;
+            // deterministic tiebreak so the order never wobbles between runs
+            return string.CompareOrdinal(a.Model, b.Model);
+        });
 
         st.Order = viable.Select(r => r.Model).ToArray();
         st.LastOk = DateTimeOffset.UtcNow;
@@ -337,6 +371,16 @@ public sealed class ModelScorerService : BackgroundService
         }
     }
 
+    /// <summary>Most expensive observed $/request among paid models; the normaliser
+    /// for the price term. Guarded so a zero/empty cohort cannot divide by zero
+    /// and flatten every paid model to the same score.</summary>
+    static double PaidRefCost(IEnumerable<Scored> rows)
+    {
+        var m = rows.Where(r => !r.Free && r.UsdPerReq > 0)
+                    .Select(r => r.UsdPerReq).DefaultIfEmpty(0).Max();
+        return m > 0 ? m : 1e-9;
+    }
+
     static long Median(IEnumerable<long> xs)
     {
         var a = xs.Where(x => x > 0).OrderBy(x => x).ToArray();
@@ -355,16 +399,22 @@ public sealed class ModelScorerService : BackgroundService
             long ok = s?.Ok ?? 0, fail = s?.Fail ?? 0, n = ok + fail;
             double rel = n >= MinReliabilitySample ? (double)ok / n : ReliabilityPrior;
             byModel.TryGetValue(m, out var rate);
+            var qe = _state.Quality.GetValueOrDefault(m);
+            bool isFree = rate?.IsFree ?? false;
+            bool bench = (qe?.Confidence ?? 0) > 0;
             arr.Add(new JsonObject
             {
                 ["model"] = m,
-                ["free"] = rate?.IsFree ?? false,
+                ["free"] = isFree,
+                // 0 free, 1 paid+benchmarked, 2 paid+unknown-quality
+                ["tier"] = isFree ? 0 : (bench ? 1 : 2),
+                ["benchmarked"] = bench,
                 ["observed"] = n,
                 ["ok"] = ok,
                 ["fail"] = fail,
                 ["rate_limited"] = s?.RateLimited ?? 0,
                 ["reliability"] = Math.Round(rel, 4),
-                ["quality"] = _state.Quality.TryGetValue(m, out var qe) ? qe.Quality : null,
+                ["quality"] = qe?.Quality,
                 ["quality_conf"] = qe?.Confidence,
                 ["quality_sources"] = qe?.Sources ?? 0,
                 ["ttft_ms"] = qe != null && qe.TtftMs >= 0 ? qe.TtftMs : null,
