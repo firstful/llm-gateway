@@ -22,13 +22,6 @@ namespace LlmGateway;
 /// </summary>
 public static class QualitySources
 {
-    sealed class Raw
-    {
-        public double Value;   // higher = better
-        public double Weight;
-        public bool Inverse;   // true when lower raw is better (e.g. latency)
-    }
-
     static readonly HttpClient Http = new(new SocketsHttpHandler
     {
         ConnectTimeout = TimeSpan.FromSeconds(10),
@@ -145,7 +138,7 @@ public static class QualitySources
             {
                 var id = m?["id"]?.GetValue<string>();
                 if (id is null) continue;
-                var aa = m["benchmarks"]?["artificial_analysis"] as JsonObject;
+                var aa = m?["benchmarks"]?["artificial_analysis"] as JsonObject;
                 var idx = aa?["intelligence_index"];
                 if (idx is null) continue;
                 double v;
