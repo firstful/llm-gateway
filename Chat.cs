@@ -523,9 +523,20 @@ public static class Chat
         {
             var waitStart = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var capMs = Env.RecoveryMaxWaitSeconds * 1000L;
-            ctx.Response.StatusCode = 200;
-            ctx.Response.ContentType = "text/event-stream";
-            ctx.Response.Headers["Cache-Control"] = "no-cache";
+            attempts.Add(new ReqLog.Attempt("-", "-", "recovery-enter", 0,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00,
+                $"chain exhausted after {attempts.Count} attempt(s); keep-alive up to {Env.RecoveryMaxWaitSeconds}s"));
+            // Only set status/headers when the response has not already started.
+            // A recovery retry (goto streamRetry) means a previous pass already
+            // began streaming; re-setting StatusCode then throws
+            // InvalidOperationException -> unhandled -> client sees a truncated
+            // 200 and retries. Same guard as the single-route passthrough above.
+            if (!ctx.Response.HasStarted)
+            {
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.Headers["Cache-Control"] = "no-cache";
+            }
             while (true)
             {
                 try
@@ -547,6 +558,9 @@ public static class Chat
                 foreach (var (k, up) in routes)
                     if (await Providers.ProbeAsync(k) is { Reachable: true } probe)
                         recovered.Add((k, up));
+                attempts.Add(new ReqLog.Attempt("-", "-", "recovery-probe", 0,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00,
+                    $"{routes.Count - recovered.Count}/{routes.Count} leg(s) down; up=[{string.Join(",", recovered.Select(r => r.Key + ":" + r.Upstream))}]"));
                 if (recovered.Count > 0)
                 {
                     routes = recovered;
