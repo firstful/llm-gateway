@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -17,9 +18,13 @@ public static class ModelMetrics
         public long Ok, Fail, RateLimited, Reqs;
         public double Usd;
         public long Prompt, Completion, Cached;
+        // When this counter's outcome totals were last decayed. Per-counter so a
+        // model first seen mid-life does not instantly decay its fresh history.
+        public long DecayedAtTicks = DateTimeOffset.UtcNow.UtcTicks;
     }
 
     static readonly ConcurrentDictionary<string, Counter> Map = new();
+    static readonly object DecayLock = new();
 
     /// <summary>Normalise a metric key to the bare model id.
     ///
@@ -61,7 +66,7 @@ public static class ModelMetrics
 
     /// <summary>Restore persisted counters at startup.</summary>
     public static void Seed(string model, long ok, long fail, long rl, long reqs,
-        double usd, long prompt, long completion, long cached)
+        double usd, long prompt, long completion, long cached, long decayedAtUnix = 0)
     {
         var c = Get(model);
         Interlocked.Exchange(ref c.Ok, ok);
@@ -72,6 +77,78 @@ public static class ModelMetrics
         Interlocked.Exchange(ref c.Completion, completion);
         Interlocked.Exchange(ref c.Cached, cached);
         lock (c) { c.Usd = usd; }
+        // A file written before decay existed has no timestamp. Leave the fresh
+        // "now" default rather than back-dating to the epoch, which would erase
+        // every historical counter on the first tick.
+        if (decayedAtUnix > 0)
+            Interlocked.Exchange(ref c.DecayedAtTicks,
+                DateTimeOffset.FromUnixTimeSeconds(decayedAtUnix).UtcTicks);
+    }
+
+    /// <summary>Exponentially forget old outcomes.
+    ///
+    /// Counters used to be strictly cumulative, which made the reliability gate a
+    /// life sentence: cat-jam-free sat at 2071 ok / 236 fail (0.898) against a
+    /// 0.90 floor, so one bad week excluded it permanently no matter how well it
+    /// behaved afterwards -- and because it was excluded it got no traffic, so
+    /// the ratio could never recover. The gate fed on its own exclusion.
+    ///
+    /// Ok and Fail are scaled together, so the observed ratio is preserved while
+    /// the effective sample shrinks. Once a stale model decays below
+    /// MinReliabilitySample the existing prior takes over and it becomes eligible
+    /// for a retest; if it is genuinely still broken the new failures rebuild the
+    /// ratio long before the window closes, so this forgives rather than forgets.
+    ///
+    /// Only the outcome counters decay. Reqs/Usd/token totals stay cumulative
+    /// because they are lifetime cost accounting, not a quality signal.</summary>
+    public static void Decay(TimeSpan halfLife)
+    {
+        if (halfLife <= TimeSpan.Zero) return;
+        var now = DateTimeOffset.UtcNow;
+        lock (DecayLock)
+        {
+            foreach (var c in Map.Values)
+            {
+                var last = new DateTimeOffset(Interlocked.Read(ref c.DecayedAtTicks), TimeSpan.Zero);
+                var elapsed = now - last;
+                // Sub-second elapsed is not a decay, it is two callers racing
+                // (Refresh and Flush can land together). Decaying on it would
+                // floor a counter down by one for no reason.
+                if (elapsed.TotalSeconds < 1) continue;
+                double f = Math.Pow(0.5, elapsed.TotalHours / halfLife.TotalHours);
+                if (f >= 1.0) continue;
+                Scale(ref c.Ok, f);
+                Scale(ref c.Fail, f);
+                Scale(ref c.RateLimited, f);
+                Interlocked.Exchange(ref c.DecayedAtTicks, now.UtcTicks);
+            }
+        }
+    }
+
+    /// <summary>Multiply a counter field by f, racing safely against the
+    /// Interlocked.Increment on the request path. Floor, so a counter shrinks
+    /// monotonically and eventually reaches zero instead of hovering at 1.</summary>
+    static void Scale(ref long field, double f)
+    {
+        long cur = Interlocked.Read(ref field);
+        while (true)
+        {
+            long next = (long)Math.Floor(cur * f);
+            long prev = Interlocked.CompareExchange(ref field, next, cur);
+            if (prev == cur) return;
+            cur = prev;
+        }
+    }
+
+    /// <summary>When the persisted totals were last decayed, for round-tripping
+    /// the decay clock across restarts.</summary>
+    public static long DecayedAtUnix()
+    {
+        var max = 0L;
+        foreach (var c in Map.Values)
+            max = Math.Max(max, Interlocked.Read(ref c.DecayedAtTicks));
+        return max == 0 ? DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                        : new DateTimeOffset(max, TimeSpan.Zero).ToUnixTimeSeconds();
     }
 
     public sealed record Snapshot(long Ok, long Fail, long RateLimited, long Reqs,
@@ -113,6 +190,10 @@ public static class MetricsStore
     {
         try
         {
+            // Decay before snapshotting so the persisted totals and the decay
+            // clock move together; otherwise a restart would replay an interval
+            // that was already partly decayed.
+            ModelMetrics.Decay(Env.MetricsHalfLife);
             var snap = ModelMetrics.All();
             var o = new JsonObject();
             foreach (var (m, s) in snap)
@@ -122,6 +203,7 @@ public static class MetricsStore
                     ["rl"] = s.RateLimited, ["reqs"] = s.Reqs,
                     ["usd"] = s.Usd, ["p"] = s.Prompt,
                     ["c"] = s.Completion, ["k"] = s.Cached,
+                    ["decayed_at"] = ModelMetrics.DecayedAtUnix(),
                 };
             var dir = System.IO.Path.GetDirectoryName(Path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -158,7 +240,8 @@ public static class MetricsStore
                     r["usd"]?.GetValue<double>() ?? 0,
                     (long)(r["p"]?.GetValue<double>() ?? 0),
                     (long)(r["c"]?.GetValue<double>() ?? 0),
-                    (long)(r["k"]?.GetValue<double>() ?? 0));
+                    (long)(r["k"]?.GetValue<double>() ?? 0),
+                    (long)(r["decayed_at"]?.GetValue<double>() ?? 0));
                 n++;
             }
             Console.WriteLine($"[metrics] restored {n} model counter(s) from {Path}");
@@ -235,6 +318,10 @@ public sealed class ModelScorerService : BackgroundService
     const double MinReliability = 0.75;   // hard floor, below this it is noise
     const double CostWeightBase = 0.25;   // quota comfortable (still reported)
     const double CostWeightMax = 0.75;    // quota nearly exhausted
+    // Paid models are dropped once a Go usage window is this close to spent.
+    // Below it the tilt in CostWeight is enough; at or above it the remaining
+    // headroom is too small to be worth a request that is likely to 429.
+    const double QuotaHighWaterPct = 90;
     const int QualityTtlMinutes = 360;    // 6h; these indexes move slowly
 
     sealed class Rate
@@ -257,7 +344,7 @@ public sealed class ModelScorerService : BackgroundService
         public double TtftMs = -1;
         public int QualitySources;
         public int Tier;              // 0 free, 1 paid+benchmarked, 2 paid+unknown
-        public bool Benchmarked, FastOk, ReliableOk;
+        public bool Benchmarked, FastOk, ReliableOk, QuotaOk;
     }
 
     /// <summary>Immutable scorer state, published as a single reference so
@@ -279,6 +366,11 @@ public sealed class ModelScorerService : BackgroundService
     static State S => _state;
 
     public static string[] Current => _state.Order;
+
+    /// <summary>True when the last refresh saw a Go usage window that disqualifies
+    /// paid models. Surfaced in /status.json so the gate is observable even
+    /// though a quota-blocked model can never appear in <see cref="Current"/>.</summary>
+    public static bool PaidQuotaBlocked => PaidSpendBlocked(_state.Quota);
     public static JsonNode? Quota => _state.Quota;
     public static double CostWeight => _state.CostWeight;
     public static DateTimeOffset LastOk => _state.LastOk;
@@ -289,7 +381,33 @@ public sealed class ModelScorerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // First pass immediately so the list exists before traffic arrives.
+        // First pass must land before traffic arrives. `auto` and `free` have
+        // no chain behind them any more, so until this succeeds they cannot
+        // route at all. Retry with backoff rather than leaving the scorer
+        // empty on a transient failure (a usage-endpoint blip on the first
+        // pass should not take the gateway down for the full 5 min tick).
+        for (int attempt = 1; !ct.IsCancellationRequested; attempt++)
+        {
+            bool ranked;
+            try
+            {
+                await Refresh(ct);
+                ranked = Current.Length > 0;
+            }
+            catch (Exception e)
+            {
+                var cur = _state; cur.LastError = e.GetType().Name + ": " + e.Message;
+                ranked = false;
+            }
+            if (ranked || attempt >= FirstPassMaxAttempts) break;
+            try
+            {
+                await Task.Delay(FirstPassDelay(attempt), ct);
+            }
+            catch (OperationCanceledException) { return; }
+        }
+
+        // Steady state: refresh on entry, then every RefreshMinutes.
         while (!ct.IsCancellationRequested)
         {
             try { await Refresh(ct); }
@@ -301,6 +419,10 @@ public sealed class ModelScorerService : BackgroundService
             catch (OperationCanceledException) { return; }
         }
     }
+
+    const int FirstPassMaxAttempts = 5;
+    static TimeSpan FirstPassDelay(int attempt) =>
+        TimeSpan.FromSeconds(Math.Min(30, 2 << (attempt - 1)));   // 2s, 4s, 8s, 16s, 30s
 
     static async Task<JsonNode?> GetJson(string url, string? bearer)
     {
@@ -394,6 +516,9 @@ public static bool NeedsReasoningEcho(string model)
 
     async Task Refresh(CancellationToken ct)
     {
+        // Age the evidence before reading it, so a model whose failures are
+        // stale stops being judged on them.
+        ModelMetrics.Decay(Env.MetricsHalfLife);
         var roster = ParseRoster(await GetJson(ApiJson, null));
         if (roster.Length == 0)
             throw new InvalidOperationException("api.json returned no opencode-go models");
@@ -419,6 +544,11 @@ public static bool NeedsReasoningEcho(string model)
         double pressure = pcts.Count > 0 ? pcts.Max() / 100.0 : 0;
         st.CostWeight = CostWeightBase +
             (CostWeightMax - CostWeightBase) * Math.Min(1.0, pressure / 0.8);
+
+        // CostWeight only tilts price *within* the paid tier, which is no use
+        // once the window is gone: every paid model 429s regardless of price.
+        // So the same payload also disqualifies paid spend outright.
+        bool paidBlocked = PaidSpendBlocked(st.Quota);
 
         var obs = ModelMetrics.All();
         var rows = new List<Scored>();
@@ -490,6 +620,9 @@ public static bool NeedsReasoningEcho(string model)
             r.Benchmarked = benchmarked;
             r.FastOk = r.TtftMs < 0 || r.TtftMs <= FastTtftMs;   // unknown = unproven, not failed
             r.ReliableOk = r.Reliability >= GateReliability;
+            // A tripped Go usage window disqualifies paid models outright.
+            // Free models are a separate pool, so they are unaffected.
+            r.QuotaOk = r.Free || !paidBlocked;
             r.Score = r.Tier switch
             {
                 // free: reliability dominates, speed breaks ties
@@ -510,8 +643,10 @@ public static bool NeedsReasoningEcho(string model)
         }
 
         // Never emit an empty or all-gated-out list: if everything fails the
-        // gates, fall back to the full set ordered by tier and score.
-        var viable = tiered.Where(r => r.ReliableOk && r.FastOk).ToList();
+        // gates, fall back to the full set ordered by tier and score. This also
+        // covers the quota gate: if every free model is gone too, re-admitting
+        // quota-blocked paid models beats serving nothing at all.
+        var viable = tiered.Where(r => r.ReliableOk && r.FastOk && r.QuotaOk).ToList();
         if (viable.Count == 0) viable = tiered;
 
         viable.Sort((a, b) =>
@@ -562,6 +697,39 @@ public static bool NeedsReasoningEcho(string model)
         }
     }
 
+    /// <summary>True when OpenCode Go's usage API says paid spend is spent out,
+    /// or close enough that spending it is a waste.
+    ///
+    /// This is the difference between learning the limit and discovering it.
+    /// The reliability gate only excludes a paid model once it has *observed*
+    /// enough 429s to fall under it -- which is why a tripped window used to
+    /// cost thousands of real requests (kimi-k3: ok 1, fail 2220) before the
+    /// scorer stopped reaching for it. The usage payload already tells us.
+    ///
+    /// Free models are a separate pool with their own flat daily cap, so a USD
+    /// window says nothing about them and never disqualifies one. A missing or
+    /// unreadable payload gates nothing: absent data must not be read as
+    /// "exhausted", or a blip on the usage endpoint would take down paid
+    /// routing entirely.</summary>
+    static bool PaidSpendBlocked(JsonNode? quota)
+    {
+        if (quota?["usage"] is not JsonObject usage) return false;
+        foreach (var (_, w) in usage)
+        {
+            if (w is not JsonObject win) continue;
+            // The explicit verdict wins over the number: "rate-limited" is the
+            // endpoint telling us the window is gone.
+            var status = win["status"]?.GetValue<string>();
+            if (string.Equals(status, "rate-limited", StringComparison.OrdinalIgnoreCase))
+                return true;
+            var pct = win["percent"];
+            if (pct is not null && pct.GetValueKind() == JsonValueKind.Number
+                && pct.GetValue<double>() >= QuotaHighWaterPct)
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Most expensive observed $/request among paid models; the normaliser
     /// for the price term. Guarded so a zero/empty cohort cannot divide by zero
     /// and flatten every paid model to the same score.</summary>
@@ -599,6 +767,7 @@ public static bool NeedsReasoningEcho(string model)
                 ["free"] = isFree,
                 // 0 free, 1 paid+benchmarked, 2 paid+unknown-quality
                 ["tier"] = isFree ? 0 : (bench ? 1 : 2),
+                ["quota_blocked"] = isFree ? false : PaidSpendBlocked(_state.Quota),
                 ["benchmarked"] = bench,
                 ["observed"] = n,
                 ["ok"] = ok,

@@ -133,6 +133,8 @@ app.MapGet("/status.json", async () =>
             ["cost_weight"] = ModelScorerService.CostWeight,
             ["pin"] = ModelPin.Describe(),
             ["quota"] = ModelScorerService.Quota?["usage"]?.DeepClone(),
+            ["paid_quota_blocked"] = ModelScorerService.PaidQuotaBlocked,
+            ["metrics_half_life_h"] = Env.MetricsHalfLife.TotalHours,
             ["order"] = new JsonArray(ModelScorerService.Current.Select(m => (JsonNode)m!).ToArray()),
             ["models"] = ModelScorerService.Describe(),
         },

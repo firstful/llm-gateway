@@ -15,9 +15,9 @@ namespace LlmGateway;
 ///                     free models live here under their own ids
 ///   OCG-&lt;model&gt;    -> opencode-go   (https://opencode.ai/zen/go/v1) — weekly-capped
 ///   LOCAL-&lt;model&gt;  -> local GPU     (llama-ctrl; ONLY when LOCAL_ENABLED=1)
-///   auto           -> explicit ordered fallback chain — see AUTO_CHAIN
-///                     (comma-separated "provider:model" legs, tried in
-///                     sequence), then LOCAL-&lt;LOCAL_MODEL&gt; if enabled
+///   auto / free   -> the scorer-ranked list (free tier first, gated on
+///                     reliability, speed and the OpenCode Go quota windows);
+///                     the serving path just walks it top to bottom
 ///
 /// Chat sessions persist server-side (SQLite + cookie), the UI shows live
 /// provider + local-LLM status.
@@ -29,31 +29,9 @@ public static class Env
     public const string AppVersion = "2.1.0";
 
     // Only used as a fallback advertisement when a provider /models listing
-    // can't be verified. The actual auto chain is explicit — see AUTO_CHAIN.
+    // can't be verified. `auto`/`free` routing is owned entirely by
+    // ModelScorerService — there is no hand-maintained chain any more.
     public static string AutoModel { get; } = EnvOr("AUTO_MODEL", "mimo-v2.5");
-    // Explicit ordered fallback chain for `auto`: comma-separated "provider:model"
-    // legs, tried in sequence. Each leg is plainly named — no implicit AGNO rules.
-    public static string AutoChainRaw { get; } = EnvOr(
-        "AUTO_CHAIN", "ocg:mimo-v2.5,or:openrouter/free,or:deepseek/deepseek-v4-flash");
-    // Ordered chain for the `free` pseudo-model: ZERO-COST legs only. OpenCode
-    // ZEN is entirely free, so every live zen model is fair game (the zero-cost
-    // *-free ids first, then the rest); OpenCode GO is a paid service, so only its
-    // "Unlimited"-tier models (space-bunny-free, longcat-2.5-preview-free) are used;
-    // openrouter/free last. Override wholesale with the FREE_CHAIN env var.
-    public static string FreeChainRaw { get; } = EnvOr(
-        "FREE_CHAIN",
-        "ocz:big-pickle,ocz:ling-3.1-flash-free,ocz:fledge-alpha-free,ocz:mimo-v2.5-free,"
-        + "ocz:mimo-v2.6-flash-free,ocz:muse-spark-1.2-contributor-free,ocz:muse-spark-1.3-contributor-free,ocz:nemotron-3.5-lightning-free,"
-        + "ocz:jev-1.13-free,ocz:longcat-2.5-preview-free,ocz:space-bunny-free,ocz:jev-1.13,"
-        + "ocz:claude-fable-5-1,ocz:claude-haiku-4-5,ocz:claude-opus-5-5,ocz:claude-sonnet-5-5,"
-        + "ocz:deepseek-v4.1-flash,ocz:deepseek-v4-pro,ocz:gemini-3.1-pro,ocz:gemini-3.5-flash-lite,"
-        + "ocz:gemini-3.8-flash,ocz:glm-5.3,ocz:glm-5.3-flash,ocz:gpt-5.3-codex,"
-        + "ocz:gpt-5.3-codex-spark,ocz:gpt-5.4-mini,ocz:gpt-5.4-nano,ocz:gpt-5.5,"
-        + "ocz:gpt-5.5-pro,ocz:gpt-6-astra,ocz:gpt-6-sol,ocz:gpt-6.1-sol,"
-        + "ocz:gpt-6-luna,ocz:gpt-5.6-terra,ocz:grok-4.7,ocz:grok-build-0.1,"
-        + "ocz:kimi-k2.7-code,ocz:kimi-k3,ocz:minimax-m3,ocz:muse-spark-1.3,"
-        + "ocz:qwen3.6-plus,ocz:qwen3.8-flash,ocg:space-bunny-free,ocg:longcat-2.5-preview-free,"
-        + "or:openrouter/free,");
     public static string LocalModel { get; } = EnvOr("LOCAL_MODEL", "lfm2.5-2.6b");
     public static int ModelsCacheTtl { get; } = IntOr("MODELS_CACHE_TTL", 300);
 
@@ -106,6 +84,13 @@ public static class Env
     public static int ReqLogKeepFiles { get; } = IntOr("REQ_LOG_KEEP_FILES", 10);
     public static int ReqLogWindowSeconds { get; } = IntOr("REQ_LOG_WINDOW_SECONDS", 600);
     public static int StatsFlushSeconds { get; } = IntOr("STATS_FLUSH_SECONDS", 30);
+
+    /// <summary>Half-life, in hours, of a model's observed ok/fail history. After
+    /// this long a past outcome counts half as much as it did, so a model that
+    /// has genuinely recovered is not still disqualified by last month's 429s.
+    /// 0 disables decay and restores strictly cumulative counters.</summary>
+    public static TimeSpan MetricsHalfLife { get; } =
+        TimeSpan.FromHours(Math.Max(0, IntOr("METRICS_HALF_LIFE_HOURS", 24)));
     public static string TelemetryUrl { get; } = EnvOr("TELEMETRY_URL", "").TrimEnd('/');
     public static int TelemetryMaxBytes { get; } = IntOr("TELEMETRY_MAX_BYTES", 3800);
     public static int RecoveryKeepAliveSeconds { get; } = IntOr("RECOVERY_KEEPALIVE_SECONDS", 5);
@@ -163,33 +148,7 @@ public static class Providers
 
     public static readonly List<Provider> All = Build();
 
-    // Explicit ordered fallback chain for `auto` (from AUTO_CHAIN). Each leg is
-    // (provider_key, upstream_model); only providers actually in the registry are
-    // kept, so a leg referencing a removed provider is silently dropped.
-    public static readonly List<(string Key, string Model)> AutoChain = ParseChain(Env.AutoChainRaw);
-
-    static (string? Key, string? Model) ParseLeg(string leg)
-    {
-        var i = leg.IndexOf(':');
-        if (i <= 0) return (null, null);
-        var key = leg[..i].Trim().ToLowerInvariant();
-        var model = leg[(i + 1)..].Trim();
-        if (model.Length == 0 || !All.Any(p => p.Key == key)) return (null, null);
-        return (key, model);
-    }
-
-    // Ordered chain for the `free` pseudo-model (from FREE_CHAIN). Same
-    // "provider:model" leg syntax as AUTO_CHAIN.
-    public static readonly List<(string Key, string Model)> FreeChain = ParseChain(Env.FreeChainRaw);
-
-    static List<(string Key, string Model)> ParseChain(string raw) =>
-        raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(ParseLeg)
-            .Where(l => l.Key is not null)
-            .Select(l => (l.Key!, l.Model!))
-            .ToList();
-
-    // fallback on these upstream outcomes for auto chains
+    // fallback on these upstream outcomes when walking the scored ranking
     public static readonly HashSet<int> FallbackStatus = new() { 401, 402, 403, 408, 429, 500, 502, 503, 504 };
 
     static readonly ConcurrentDictionary<string, (DateTime At, HashSet<string>? Ids)> ModelsCache = new();
@@ -203,28 +162,6 @@ public static class Providers
 
     /// <summary>
     /// Automatic model resolution for auto chain legs: map the desired
-    /// model name to an id the provider actually serves, or null when a
-    /// verifiable /models listing shows no match (the leg is skipped so the
-    /// chain falls through instead of dying on an upstream 404, which is NOT
-    /// in FallbackStatus). Only OCZ resolves today — zen's free-model ids
-    /// differ from the /go endpoint's (exact -> alias -> +free -> -free).
-    /// </summary>
-    public static async Task<string?> ResolveAutoAsync(string key, string want)
-    {
-        if (key != "ocz") return want;
-        var ids = await ProviderModelsAsync(key);
-        if (ids is null || ids.Count == 0)
-        {
-            // can't verify — best static guess (upstream errors fall through)
-            return OczAliases.TryGetValue(want, out var blind) ? blind : want;
-        }
-        if (ids.Contains(want)) return want;
-        if (OczAliases.TryGetValue(want, out var alias) && ids.Contains(alias)) return alias;
-        if (ids.Contains(want + "-free")) return want + "-free";
-        if (want.EndsWith("-free") && ids.Contains(want[..^5])) return want[..^5];
-        return null; // verifiably not served -> skip this leg
-    }
-
     // DeepSeek thinking-mode echo cache: keyed by tool_call id, capped.
     static readonly object EchoLock = new();
     static readonly Dictionary<string, string> ReasoningEcho = new();
@@ -352,8 +289,11 @@ public static class Providers
         return picks.Select(m => (Key: "ocg", Upstream: m)).ToList();
     }
 
-    /// <summary>Ordered (provider_key, upstream_model) chain for a model name.</summary>
-    public static async Task<List<(string Key, string Upstream)>> ResolveAsync(string? model)
+    /// <summary>Ordered (provider_key, upstream_model) route list for a model name.
+    /// Synchronous: the only thing it used to await was the removed chain's
+    /// per-leg upstream resolution, and nothing since depends on that being async.
+    /// </summary>
+    public static Task<List<(string Key, string Upstream)>> ResolveAsync(string? model)
     {
         if (string.IsNullOrWhiteSpace(model))
             throw new ApiError(400, "model is required");
@@ -374,28 +314,21 @@ public static class Providers
                     foreach (var r in Ranked(low))
                         if (!pinned.Any(c => c.Item2 == r.Upstream)) pinned.Add(r);
                 }
-                return pinned;
+                return Task.FromResult<List<(string, string)>>(pinned);
             }
 
             // The scorer owns the ranked list; the serving path is a dumb
             // executor that walks it top-to-bottom until one model works.
             // OpenCode Go only -- OpenRouter and OpenCode Zen were dropped.
             var ranked = Ranked(low);
-            if (ranked.Count > 0) return ranked;
+            if (ranked.Count > 0) return Task.FromResult<List<(string, string)>>(ranked);
 
-            // Cold start: the background scorer has not completed its first
-            // pass yet. Serve from the configured chain rather than handing
-            // back an empty route list.
-            var legs = low == "free" ? FreeChain : AutoChain;
-            var chain = new List<(string Key, string Upstream)>();
-            foreach (var (k, want) in legs)
-            {
-                var up = await ResolveAutoAsync(k, want);
-                if (up is not null) chain.Add((k, up));
-            }
-            if (chain.Count == 0)
-                chain = legs.Select(l => (l.Key, l.Model)).ToList();
-            return chain;
+            // No ranked list yet: the scorer has not completed its first pass.
+            // There is no chain to fall back on any more -- the scorer retries
+            // its first pass at startup precisely so this window stays tiny --
+            // so fail loudly rather than serving an empty route list.
+            throw new ApiError(503,
+                $"model '{m}': the scorer's first ranking pass has not completed yet; retry in a few seconds");
         }
 
         foreach (var key in new[] { "or", "ocz", "ocg", "local" })
@@ -404,7 +337,7 @@ public static class Providers
             var upstream = m[(key.Length + 1)..].Trim();
             if (upstream.Length == 0)
                 throw new ApiError(400, $"model '{m}': missing upstream model after '{key}-'");
-            return new List<(string, string)> { (key, upstream) };
+            return Task.FromResult<List<(string, string)>>(new() { (key, upstream) });
         }
 
         throw new ApiError(404,
