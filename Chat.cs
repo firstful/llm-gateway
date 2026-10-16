@@ -103,6 +103,33 @@ public static class Chat
         return null;
     }
 
+    /// <summary>Whether any message in the conversation carries an image
+    /// (OpenAI chat-style `image_url` parts or Responses-style `input_image`
+    /// items). The gateway is text-only for now: image requests cost upstream
+    /// credits, so we reject them up front before resolving a provider.</summary>
+    static bool HasImageContent(JsonArray? messages)
+    {
+        if (messages is null) return false;
+        foreach (var m in messages)
+        {
+            var msg = m as JsonObject;
+            if (msg is null) continue;
+            if (msg["content"] is JsonArray parts)
+            {
+                foreach (var part in parts)
+                {
+                    var obj = part as JsonObject;
+                    var t = obj?["type"]?.GetValue<string>()?.ToLowerInvariant();
+                    if (t is "image_url" or "image" or "input_image" or "image_file")
+                        return true;
+                    if (obj?["image_url"] is not null || obj?["input_image"] is not null)
+                        return true;
+                }
+            }
+        }
+        return false;
+    }
+
     /// <summary>Reconstruct assistant content from OpenAI SSE stream bytes.</summary>
     static string SseReplyText(byte[] raw)
     {
@@ -288,6 +315,8 @@ public static class Chat
     {
         var body = await ParseBody(ctx);
         if (body is null) throw new ApiError(400, "request body must be JSON");
+        if (HasImageContent(body!["messages"] as JsonArray))
+            throw new ApiError(400, "image input is disabled in llm-gateway. Send text-only requests.");
         var model = body!["model"]?.GetValue<string>();
         // Resolve the conversation once per request: with no cookie this does
         // an exact-prefix lookup, and every use below must see the same id.
@@ -701,6 +730,10 @@ public static class Chat
                     break;
                 case "reasoning":
                     continue; // reasoning summaries don't map to chat messages
+                case "input_image":
+                case "image":
+                case "image_url":
+                    throw new ApiError(400, "image input is disabled in llm-gateway. Send text-only requests.");
                 default:
                     throw new ApiError(400, $"unsupported input item type '{type}'");
             }
@@ -770,6 +803,18 @@ public static class Chat
             throw new ApiError(400, "previous_response_id is not supported (pass full input history)");
 
         var model = body["model"]?.GetValue<string>() ?? "auto";
+
+        // Block image payloads supplied as top-level input items up front, so
+        // we never spend credits upstream. ResponsesInputToMessages would
+        // otherwise silently drop `input_image` items.
+        if (body["input"] is JsonArray topIn)
+        {
+            foreach (var n in topIn)
+            {
+                if (n is JsonObject o && (o["type"]?.GetValue<string>()?.ToLowerInvariant() is "input_image" or "image" or "image_url"))
+                    throw new ApiError(400, "image input is disabled in llm-gateway. Send text-only requests.");
+            }
+        }
 
         // translate Responses API request -> chat.completions request
         var chatPayload = new JsonObject
