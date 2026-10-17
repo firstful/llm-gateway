@@ -309,6 +309,86 @@ public static class Chat
         return msg;
     }
 
+    // ---------------- degraded responses ----------------
+
+    /// <summary>Human-readable assistant text for a request that outlived every
+    /// backend retry.
+    ///
+    /// Written to be coherent in a transcript rather than to be an error string:
+    /// the caller asked a question, so it gets an answer-shaped reply that says
+    /// what happened and when to try again. The usage window's reset time is
+    /// included when we know it, because "try later" is much more useful when
+    /// "later" has a timestamp.</summary>
+    /// <summary>Only real upstream attempts. The recovery block appends sentinel
+    /// entries ("recovery-enter", "recovery-probe") that carry status 0 by
+    /// design; leaving them in made the rate-limit test below see a non-429 and
+    /// report "no backend could be reached" when every attempt had in fact been
+    /// rate-limited.</summary>
+    static IEnumerable<ReqLog.Attempt> UpstreamAttempts(IReadOnlyList<ReqLog.Attempt> attempts) =>
+        attempts.Where(a => a.Outcome is not ("recovery-enter" or "recovery-probe"));
+
+    static string DegradedText(string model, IReadOnlyList<ReqLog.Attempt> attempts)
+    {
+        var real = UpstreamAttempts(attempts).ToList();
+        var why = real.Count > 0 && real.All(a =>
+                       a.Status == 429 || (a.Detail?.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ?? false))
+            ? "every model backend is currently rate-limited"
+            : "no model backend could be reached";
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append("I wasn't able to answer this one. ");
+        sb.Append(char.ToUpperInvariant(why[0])).Append(why[1..]);
+        sb.Append(", and this gateway has no capacity left to fall back on.");
+        sb.Append(" Your request itself was fine — nothing is wrong with it.");
+
+        if (ModelScorerService.NextQuotaReset() is { } reset)
+        {
+            var mins = (int)Math.Round((reset - DateTimeOffset.UtcNow).TotalMinutes);
+            sb.Append(mins > 0
+                ? $" The current usage window resets in about {mins} minute(s), at {reset:HH:mm} UTC."
+                : $" The current usage window resets at {reset:HH:mm} UTC.");
+        }
+        else
+        {
+            sb.Append(" These limits are time-based, so trying again shortly should work.");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>A well-formed chat.completion carrying <see cref="DegradedText"/>.
+    /// Usage is zeroed because no model produced any of these tokens.</summary>
+    static JsonObject DegradedChat(string modelAlias, string text) => new()
+    {
+        ["id"] = $"chatcmpl-degraded-{Guid.NewGuid():N}",
+        ["object"] = "chat.completion",
+        ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+        ["model"] = modelAlias,
+        ["choices"] = new JsonArray(new JsonObject
+        {
+            ["index"] = 0,
+            ["message"] = new JsonObject { ["role"] = "assistant", ["content"] = text },
+            ["finish_reason"] = "stop",
+        }),
+        ["usage"] = new JsonObject
+        {
+            ["prompt_tokens"] = 0, ["completion_tokens"] = 0, ["total_tokens"] = 0,
+        },
+    };
+
+    /// <summary>Flag a degraded 200 so callers and monitoring can still tell this
+    /// apart from a real completion. Without this the degradation is invisible
+    /// except to whoever reads the request log.</summary>
+    static void MarkDegraded(HttpContext ctx, int upstreamStatus)
+    {
+        // On the streaming path the keep-alives have already committed the
+        // response, and headers are read-only once it has started. Setting them
+        // would throw and truncate the stream before the assistant message lands,
+        // so the flag is only attached when there is still a chance to.
+        if (ctx.Response.HasStarted) return;
+        ctx.Response.Headers["X-LLM-Gateway-Status"] = "degraded";
+        ctx.Response.Headers["X-LLM-Gateway-Upstream-Status"] = upstreamStatus.ToString();
+    }
+
     // ---------------- /v1/chat/completions ----------------
 
     public static async Task ChatCompletions(HttpContext ctx)
@@ -341,7 +421,9 @@ public static class Chat
         {
             var nsT00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var nsAttempts = new List<ReqLog.Attempt>();
+            var nsWaitStart = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             string? lastErr = null;
+        nsRetry:
             foreach (var (key, upstream) in routes)
             {
                 var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -363,7 +445,13 @@ public static class Chat
                 using (resp)
                 {
                     var status = (int)resp.StatusCode;
-                    if (Providers.FallbackStatus.Contains(status) && routes.Count > 1)
+                    // A single leg has nothing to fall through to, but a rate
+                    // limit or a transient 5xx is still worth the retry budget
+                    // and then a degraded reply rather than a raw upstream error.
+                    var retryable = Providers.FallbackStatus.Contains(status)
+                        && (routes.Count > 1
+                            || (Env.DegradeOnFailure && Providers.DegradableStatus.Contains(status)));
+                    if (retryable)
                     {
                         var detail = await ErrorSnippetAsync(resp);
                         lastErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
@@ -433,16 +521,57 @@ public static class Chat
                     return;
                 }
             }
+            // Every backend failed. Give them a bounded chance to come back before
+            // answering, so a momentary blip degrades to a retry rather than a
+            // refusal. Non-streaming callers are usually blocking on their own
+            // client timeout, hence the short DegradeMaxWaitSeconds window.
+            while (Env.DegradeOnFailure && !ctx.RequestAborted.IsCancellationRequested
+                   && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - nsWaitStart
+                        < Env.DegradeMaxWaitSeconds * 1000L)
+            {
+                try { await Task.Delay(TimeSpan.FromSeconds(Env.RecoveryKeepAliveSeconds), ctx.RequestAborted); }
+                catch (OperationCanceledException) { break; }
+
+                var back = new List<(string Key, string Upstream)>();
+                foreach (var (k, up) in routes)
+                    if (await Providers.ProbeAsync(k) is { Reachable: true })
+                        back.Add((k, up));
+                if (back.Count > 0)
+                {
+                    routes = back;
+                    nsAttempts = new List<ReqLog.Attempt>();
+                    goto nsRetry;
+                }
+            }
+
+            var nsSummary = SummarizeFailures(model ?? "auto", nsAttempts);
+            // The log records the truth regardless of how we answer the client.
             ReqLog.Write(ctx, "chat", model, false,
                 502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - nsT00, nsAttempts,
                 new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-                SummarizeFailures(model ?? "auto", nsAttempts));
-            throw new ApiError(502, SummarizeFailures(model ?? "auto", nsAttempts));
+                nsSummary);
+
+            if (Env.DegradeOnFailure)
+            {
+                MarkDegraded(ctx, 502);
+                ctx.Response.StatusCode = 200;
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(
+                    DegradedChat(model ?? "auto", DegradedText(model ?? "auto", nsAttempts)).ToJsonString());
+                return;
+            }
+            throw new ApiError(502, nsSummary);
         }
 
         // streaming: pick the first provider that responds 2xx, stream its SSE
         var t00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var attempts = new List<ReqLog.Attempt>();
+        // Recovery deadline, established once on the first entry into the
+        // recovery block and deliberately NOT reset by a `goto streamRetry`.
+        // Declaring the start time inside that block meant every retry started
+        // the clock over, so the cap was never reached whenever the provider was
+        // reachable-but-rejecting -- i.e. exactly a 429 quota wall.
+        long recoveryDeadline = 0;
         string? streamErr = null;
     streamRetry:
         foreach (var (key, upstream) in routes)
@@ -468,7 +597,11 @@ public static class Chat
             {
                 streamErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
                 ModelMetrics.Failure($"{key}:{upstream}", status);
-                if (routes.Count == 1)
+                // Same reasoning as the non-streaming path: with one leg, only
+                // genuine config/auth errors pass through verbatim.
+                var passThrough = routes.Count == 1
+                    && !(Env.DegradeOnFailure && Providers.DegradableStatus.Contains(status));
+                if (passThrough)
                 {
                     var raw = await resp.Content.ReadAsByteArrayAsync();
                     resp.Dispose();
@@ -579,8 +712,9 @@ public static class Chat
         // leaves / the cap is hit), then retry the chain from the top.
         if (!ctx.RequestAborted.IsCancellationRequested)
         {
-            var waitStart = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var capMs = Env.RecoveryMaxWaitSeconds * 1000L;
+            if (recoveryDeadline == 0)
+                recoveryDeadline = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                                    + Env.RecoveryMaxWaitSeconds * 1000L;
             attempts.Add(new ReqLog.Attempt("-", "-", "recovery-enter", 0,
                 DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00,
                 $"chain exhausted after {attempts.Count} attempt(s); keep-alive up to {Env.RecoveryMaxWaitSeconds}s"));
@@ -619,14 +753,23 @@ public static class Chat
                 attempts.Add(new ReqLog.Attempt("-", "-", "recovery-probe", 0,
                     DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00,
                     $"{routes.Count - recovered.Count}/{routes.Count} leg(s) down; up=[{string.Join(",", recovered.Select(r => r.Key + ":" + r.Upstream))}]"));
+
+                // Check the cap BEFORE acting on recovery. A provider that is
+                // reachable but rejecting (a 429 quota wall answers /models
+                // perfectly happily) used to send us straight back to
+                // streamRetry, so the cap was never reached and the stream spun
+                // keep-alives forever -- strictly worse than an error, because
+                // the client just waits. The cap is a hard bound on total
+                // recovery time, retries included.
+                if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() > recoveryDeadline)
+                    break;
+
                 if (recovered.Count > 0)
                 {
                     routes = recovered;
                     attempts = new List<ReqLog.Attempt>();
                     goto streamRetry;
                 }
-                if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - waitStart > capMs)
-                    break;
             }
             var gaveup = SummarizeFailures(model ?? "auto", attempts);
             ReqLog.Write(ctx, "chat", model, true,
@@ -634,7 +777,25 @@ public static class Chat
                 new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0, gaveup);
             try
             {
-                await ctx.Response.WriteAsync($"data: {{\"error\":{{\"message\":{JsonSerializer.Serialize(gaveup)}}}}}\n\n");
+                if (Env.DegradeOnFailure)
+                {
+                    // The stream has been open on 200 with keep-alives for the
+                    // whole recovery window, so an error frame here would be the
+                    // only non-conversational thing the client ever sees. Emit a
+                    // real assistant message instead and close it cleanly.
+                    var text = DegradedText(model ?? "auto", attempts);
+                    var esc = JsonSerializer.Serialize(text);
+                    var created = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    MarkDegraded(ctx, 502);
+                    await ctx.Response.WriteAsync(
+                        $"data: {{\"id\":\"chatcmpl-degraded\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":{JsonSerializer.Serialize(model ?? "auto")},\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{esc}}},\"finish_reason\":null}}]}}\n\n");
+                    await ctx.Response.WriteAsync(
+                        $"data: {{\"id\":\"chatcmpl-degraded\",\"object\":\"chat.completion.chunk\",\"created\":{created},\"model\":{JsonSerializer.Serialize(model ?? "auto")},\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n");
+                }
+                else
+                {
+                    await ctx.Response.WriteAsync($"data: {{\"error\":{{\"message\":{JsonSerializer.Serialize(gaveup)}}}}}\n\n");
+                }
                 await ctx.Response.WriteAsync("data: [DONE]\n\n");
                 await ctx.Response.Body.FlushAsync();
             }
@@ -857,7 +1018,9 @@ public static class Chat
         var routes = await Providers.ResolveAsync(model);
         var t00 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var attempts = new List<ReqLog.Attempt>();
+        var respWaitStart = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         string? lastErr = null;
+    respRetry:
         foreach (var (key, upstream) in routes)
         {
             var t0 = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -879,7 +1042,10 @@ public static class Chat
             using (resp)
             {
                 var status = (int)resp.StatusCode;
-                if (Providers.FallbackStatus.Contains(status) && routes.Count > 1)
+                var retryable = Providers.FallbackStatus.Contains(status)
+                    && (routes.Count > 1
+                        || (Env.DegradeOnFailure && Providers.DegradableStatus.Contains(status)));
+                if (retryable)
                 {
                     var detail = await ErrorSnippetAsync(resp);
                     lastErr = $"{Providers.ByKey(key)?.Label} HTTP {status}";
@@ -929,10 +1095,39 @@ public static class Chat
                 return;
             }
         }
+        while (Env.DegradeOnFailure && !ctx.RequestAborted.IsCancellationRequested
+               && DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - respWaitStart
+                    < Env.DegradeMaxWaitSeconds * 1000L)
+        {
+            try { await Task.Delay(TimeSpan.FromSeconds(Env.RecoveryKeepAliveSeconds), ctx.RequestAborted); }
+            catch (OperationCanceledException) { break; }
+            var back = new List<(string Key, string Upstream)>();
+            foreach (var (k, up) in routes)
+                if (await Providers.ProbeAsync(k) is { Reachable: true })
+                    back.Add((k, up));
+            if (back.Count > 0)
+            {
+                routes = back;
+                attempts = new List<ReqLog.Attempt>();
+                goto respRetry;
+            }
+        }
+        var respSummary = SummarizeFailures(model, attempts);
         ReqLog.Write(ctx, "responses", model, false,
             502, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - t00, attempts,
             new Stats.RagMeta(rag.Injected, rag.Chunks, rag.Bytes), new Stats.Usage(0, 0, 0), 0,
-            SummarizeFailures(model, attempts));
-        throw new ApiError(502, SummarizeFailures(model, attempts));
+            respSummary);
+        if (Env.DegradeOnFailure)
+        {
+            // Reuse the chat->response shaper so the degraded payload has exactly
+            // the shape a real /v1/responses reply would have.
+            var degraded = DegradedChat(model, DegradedText(model, attempts));
+            MarkDegraded(ctx, 502);
+            ctx.Response.StatusCode = 200;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(ChatToResponse(degraded, model).ToJsonString());
+            return;
+        }
+        throw new ApiError(502, respSummary);
     }
 }

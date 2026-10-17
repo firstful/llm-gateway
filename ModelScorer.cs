@@ -183,7 +183,17 @@ public static class ModelMetrics
 /// we have thousands of observations for.</summary>
 public static class MetricsStore
 {
-    const string Path = "/opt/llm-gateway/data/model-metrics.json";
+    /// <summary>Where the counters live.
+    ///
+    /// Overridable because a second gateway process pointed at this hardcoded
+    /// path will happily write its outcomes into the production counters --
+    /// which is exactly how a test run against a stub backend ends up recording
+    /// thousands of fake 429s against the real models and quietly disqualifies
+    /// the whole free tier. Any throwaway instance must set METRICS_PATH.</summary>
+    static string Path =>
+        Environment.GetEnvironmentVariable("METRICS_PATH") is { Length: > 0 } p
+            ? p : "/opt/llm-gateway/data/model-metrics.json";
+
     static bool Debug => Environment.GetEnvironmentVariable("SESSION_DEBUG") == "1";
 
     public static void Flush()
@@ -371,6 +381,29 @@ public sealed class ModelScorerService : BackgroundService
     /// paid models. Surfaced in /status.json so the gate is observable even
     /// though a quota-blocked model can never appear in <see cref="Current"/>.</summary>
     public static bool PaidQuotaBlocked => PaidSpendBlocked(_state.Quota);
+
+    /// <summary>Soonest reset across the usage windows that are exhausted or
+    /// near the high-water mark, so a degraded reply can tell the user when to
+    /// try again. Null when the usage API said nothing useful.</summary>
+    public static DateTimeOffset? NextQuotaReset()
+    {
+        if (_state.Quota?["usage"] is not JsonObject usage) return null;
+        DateTimeOffset? soonest = null;
+        foreach (var (_, w) in usage)
+        {
+            if (w is not JsonObject win) continue;
+            var status = win["status"]?.GetValue<string>();
+            var pct = win["percent"];
+            bool spent = string.Equals(status, "rate-limited", StringComparison.OrdinalIgnoreCase)
+                      || (pct is not null && pct.GetValueKind() == JsonValueKind.Number
+                          && pct.GetValue<double>() >= QuotaHighWaterPct);
+            if (!spent) continue;
+            var at = win["resetsAt"]?.GetValue<string>();
+            if (at is null || !DateTimeOffset.TryParse(at, out var when)) continue;
+            if (soonest is null || when < soonest) soonest = when;
+        }
+        return soonest;
+    }
     public static JsonNode? Quota => _state.Quota;
     public static double CostWeight => _state.CostWeight;
     public static DateTimeOffset LastOk => _state.LastOk;

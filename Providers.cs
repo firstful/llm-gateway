@@ -96,6 +96,24 @@ public static class Env
     public static int RecoveryKeepAliveSeconds { get; } = IntOr("RECOVERY_KEEPALIVE_SECONDS", 5);
     public static int RecoveryMaxWaitSeconds { get; } = IntOr("RECOVERY_MAX_WAIT_SECONDS", 600);
 
+    /// <summary>When set, an upstream failure that survives every retry comes
+    /// back as a normal HTTP 200 assistant message instead of an error status.
+    ///
+    /// The point is conversational continuity: a chat client should not slam an
+    /// error dialog mid-conversation because a backend window closed. The
+    /// tradeoff is that a caller can no longer distinguish "the model said this"
+    /// from "the gateway could not reach a model", so every degraded response
+    /// carries X-LLM-Gateway-Status and the request log still records the real
+    /// status and attempts. Turn this off to restore strict error semantics.</summary>
+    public static bool DegradeOnFailure { get; } =
+        EnvOr("DEGRADE_ON_FAILURE", "1") is not ("0" or "false" or "False");
+
+    /// <summary>How long a non-streaming request waits for a backend to come
+    /// back before degrading. Deliberately far shorter than the streaming
+    /// recovery cap: a non-streaming caller is usually blocking on a client-side
+    /// timeout, so waiting ten minutes would just become their timeout.</summary>
+    public static int DegradeMaxWaitSeconds { get; } = IntOr("DEGRADE_MAX_WAIT_SECONDS", 30);
+
     public const string RagPrefix =
         "The following is authoritative context from the homelab operator's docs and " +
         "session history (retrieved via RAG). It is FACT, not a hint — prefer it over " +
@@ -150,6 +168,20 @@ public static class Providers
 
     // fallback on these upstream outcomes when walking the scored ranking
     public static readonly HashSet<int> FallbackStatus = new() { 401, 402, 403, 408, 429, 500, 502, 503, 504 };
+
+    /// <summary>The subset of <see cref="FallbackStatus"/> worth retrying and
+    /// degrading even when only one route exists.
+    ///
+    /// With a single leg there is nothing to fall through to, so these statuses
+    /// used to be written straight back to the caller as a raw upstream error --
+    /// which is precisely the common case right now, since `auto` often resolves
+    /// to exactly one model. That bypassed the degraded path entirely.
+    ///
+    /// Auth and client errors (401, 403, 400, 404) are deliberately excluded:
+    /// those mean the gateway itself is misconfigured, and rendering them as a
+    /// polite assistant sentence would hide a broken API key behind text that
+    /// looks like a normal answer.</summary>
+    public static readonly HashSet<int> DegradableStatus = new() { 402, 408, 429, 500, 502, 503, 504 };
 
     static readonly ConcurrentDictionary<string, (DateTime At, HashSet<string>? Ids)> ModelsCache = new();
 
