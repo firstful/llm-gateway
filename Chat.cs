@@ -327,13 +327,48 @@ public static class Chat
     static IEnumerable<ReqLog.Attempt> UpstreamAttempts(IReadOnlyList<ReqLog.Attempt> attempts) =>
         attempts.Where(a => a.Outcome is not ("recovery-enter" or "recovery-probe"));
 
+    enum Exhausted { RateLimited, Credentials, Mixed }
+
+    /// <summary>Why the chain ran out, from the statuses actually observed.
+    ///
+    /// The test this replaces was binary: the attempts were either all
+    /// rate-limited or, by elimination, "no model backend could be reached".
+    /// An expired API key, a retired model id and an unreachable host all fell
+    /// into that second branch, so the reply sent the reader off to check
+    /// connectivity while the actual fault was a credential nobody had
+    /// rotated. Classify on what the upstreams said, and keep a mixed bucket so
+    /// a genuinely heterogeneous failure reports the statuses instead of
+    /// picking a side.</summary>
+    static Exhausted ClassifyExhausted(IReadOnlyList<ReqLog.Attempt> real)
+    {
+        if (real.Count == 0) return Exhausted.Mixed;
+
+        static bool RateLimited(ReqLog.Attempt a) =>
+            a.Status == 429
+            || (a.Detail?.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ?? false);
+        static bool Creds(ReqLog.Attempt a) =>
+            a.Status is 401 or 403
+            || (a.Detail?.Contains("api_key", StringComparison.OrdinalIgnoreCase) ?? false)
+            || (a.Detail?.Contains("unauthorized", StringComparison.OrdinalIgnoreCase) ?? false);
+
+        if (real.All(Creds)) return Exhausted.Credentials;
+        if (real.All(RateLimited)) return Exhausted.RateLimited;
+        return Exhausted.Mixed;
+    }
+
     static string DegradedText(string model, IReadOnlyList<ReqLog.Attempt> attempts)
     {
         var real = UpstreamAttempts(attempts).ToList();
-        var why = real.Count > 0 && real.All(a =>
-                       a.Status == 429 || (a.Detail?.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ?? false))
-            ? "every model backend is currently rate-limited"
-            : "no model backend could be reached";
+        var kind = ClassifyExhausted(real);
+        var codes = real.Select(a => a.Status).Distinct().OrderBy(s => s).ToList();
+        var why = kind switch
+        {
+            Exhausted.RateLimited => "every model backend is currently rate-limited",
+            Exhausted.Credentials => "every model backend rejected this gateway's credentials",
+            _ when real.Count == 0 => "no model backend was attempted",
+            _ => "the model backends failed (upstream status "
+                 + string.Join("/", codes) + ")",
+        };
 
         var sb = new System.Text.StringBuilder();
         sb.Append("I wasn't able to answer this one. ");
@@ -341,23 +376,36 @@ public static class Chat
         sb.Append(", and this gateway has no capacity left to fall back on.");
         sb.Append(" Your request itself was fine — nothing is wrong with it.");
 
-        if (ModelScorerService.NextQuotaReset() is { } reset)
+        if (kind == Exhausted.RateLimited)
         {
-            var mins = (int)Math.Round((reset - DateTimeOffset.UtcNow).TotalMinutes);
-            sb.Append(mins > 0
-                ? $" The current usage window resets in about {mins} minute(s), at {reset:HH:mm} UTC."
-                : $" The current usage window resets at {reset:HH:mm} UTC.");
+            if (ModelScorerService.NextQuotaReset() is { } reset)
+            {
+                var mins = (int)Math.Round((reset - DateTimeOffset.UtcNow).TotalMinutes);
+                sb.Append(mins > 0
+                    ? $" The current usage window resets in about {mins} minute(s), at {reset:HH:mm} UTC."
+                    : $" The current usage window resets at {reset:HH:mm} UTC.");
+            }
+            else
+            {
+                sb.Append(" These limits are time-based, so trying again shortly should work.");
+            }
+        }
+        else if (kind == Exhausted.Credentials)
+        {
+            // Retrying cannot help a dead key, and the old closing line told the
+            // reader to try again shortly -- the advice was worse than useless.
+            sb.Append(" This is a gateway-side fault, not yours: the provider API key needs replacing.");
         }
         else
         {
-            sb.Append(" These limits are time-based, so trying again shortly should work.");
+            sb.Append(" Retrying shortly may work once the upstream fault clears.");
         }
 
         // Triage trail. Without this the reply above is guesswork: an expired
         // credential and an unreachable host both collapse into "no model
         // backend could be reached", which sends the reader after the wrong
         // thing. Carry the chain that was actually walked plus the upstream
-        // error text, truncated, so the cause is readable from the transcript.
+        // error text verbatim, so the cause is readable from the transcript.
         if (real.Count > 0)
         {
             sb.Append(" Attempts:");
