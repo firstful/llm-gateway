@@ -352,6 +352,27 @@ public static class Chat
         {
             sb.Append(" These limits are time-based, so trying again shortly should work.");
         }
+
+        // Triage trail. Without this the reply above is guesswork: an expired
+        // credential and an unreachable host both collapse into "no model
+        // backend could be reached", which sends the reader after the wrong
+        // thing. Carry the chain that was actually walked plus the upstream
+        // error text, truncated, so the cause is readable from the transcript.
+        if (real.Count > 0)
+        {
+            sb.Append(" Attempts:");
+            for (var i = 0; i < real.Count; i++)
+            {
+                var a = real[i];
+                sb.Append(i == 0 ? " " : "; ");
+                sb.Append(a.Provider.ToLowerInvariant()).Append('/').Append(a.Upstream)
+                  .Append(" -> ").Append(a.Status);
+                var detail = a.Detail?.Trim();
+                if (!string.IsNullOrEmpty(detail))
+                    sb.Append(" (").Append(detail.Length <= 180 ? detail : detail[..180] + "...").Append(')');
+            }
+            sb.Append('.');
+        }
         return sb.ToString();
     }
 

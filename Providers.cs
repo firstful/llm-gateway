@@ -167,7 +167,12 @@ public static class Providers
     public static readonly List<Provider> All = Build();
 
     // fallback on these upstream outcomes when walking the scored ranking
-    public static readonly HashSet<int> FallbackStatus = new() { 401, 402, 403, 408, 429, 500, 502, 503, 504 };
+    // 400 is here because upstreams use it to mean "that model is unavailable"
+    // (OpenCode Go answers exactly this for a retired model id). That is an
+    // availability signal, not a gateway misconfiguration, so the walk must
+    // degrade to the next leg. It is deliberately still NOT in
+    // DegradableStatus: a 400 on the only remaining leg still surfaces raw.
+    public static readonly HashSet<int> FallbackStatus = new() { 400, 401, 402, 403, 408, 429, 500, 502, 503, 504 };
 
     /// <summary>The subset of <see cref="FallbackStatus"/> worth retrying and
     /// degrading even when only one route exists.
