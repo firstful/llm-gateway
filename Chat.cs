@@ -367,9 +367,15 @@ public static class Chat
                 sb.Append(i == 0 ? " " : "; ");
                 sb.Append(a.Provider.ToLowerInvariant()).Append('/').Append(a.Upstream)
                   .Append(" -> ").Append(a.Status);
+                // Raw, untruncated. An operator reading this transcript is
+                // debugging a provider outage and needs the provider's own
+                // words -- codes, quota numbers, reset hints -- not a summary.
+                // The text lands in the chat transcript, so anything the upstream
+                // chooses to echo (a key fragment, a tenant id) is carried into
+                // it verbatim; that is a deliberate trade for debuggability.
                 var detail = a.Detail?.Trim();
                 if (!string.IsNullOrEmpty(detail))
-                    sb.Append(" (").Append(detail.Length <= 180 ? detail : detail[..180] + "...").Append(')');
+                    sb.Append(" (").Append(detail).Append(')');
             }
             sb.Append('.');
         }
