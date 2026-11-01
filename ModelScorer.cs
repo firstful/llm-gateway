@@ -822,7 +822,7 @@ public static bool NeedsReasoningEcho(string model)
                 ["est_usd_per_req"] = rate is null
                     ? null
                     : Math.Round((s?.Reqs ?? 0) >= 10 && (s?.Usd ?? 0) > 0 ? s!.Usd / s.Reqs : Cost(m, mp, mc, mk), 8),
-                ["score"] = Math.Round(_state.ScoreOf(m), 4),
+                ["score"] = Math.Round(ModelScorerService.ScoreOf(m), 4),
                 ["input_per_1m"] = rate is null ? null : rate.Input,
                 ["output_per_1m"] = rate is null ? null : rate.Output,
             });
