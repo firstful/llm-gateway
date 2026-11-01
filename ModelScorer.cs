@@ -823,6 +823,8 @@ public static bool NeedsReasoningEcho(string model)
                 ["debug_mp"] = mp,
                 ["debug_mc"] = mc,
                 ["debug_mk"] = mk,
+                ["debug_rate_null"] = rate is null,
+                ["debug_cost_call"] = rate is null ? -1 : Cost(m, mp, mc, mk),
             });
         }
         return arr;
