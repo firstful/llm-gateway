@@ -785,6 +785,10 @@ public static bool NeedsReasoningEcho(string model)
         var arr = new JsonArray();
         var obs = ModelMetrics.All();
         var byModel = _state.Rates.ToDictionary(r => r.Model, r => r);
+        // cold-start token shape: median observed across all models
+        long mp = Median(obs.Values.Select(v => v.Prompt));
+        long mc = Median(obs.Values.Select(v => v.Completion));
+        long mk = Median(obs.Values.Select(v => v.Cached));
         foreach (var m in _state.Order)
         {
             obs.TryGetValue(m, out var s);
@@ -813,7 +817,7 @@ public static bool NeedsReasoningEcho(string model)
                 ["ttft_ms"] = qe != null && qe.TtftMs >= 0 ? qe.TtftMs : null,
                 ["est_usd_per_req"] = rate is null
                     ? null
-                    : Math.Round((s?.Reqs ?? 0) >= 10 ? s!.Usd / s.Reqs : Cost(m, 0, 0, 0), 8),
+                    : Math.Round((s?.Reqs ?? 0) >= 10 ? s!.Usd / s.Reqs : Cost(m, mp, mc, mk), 8),
             });
         }
         return arr;
