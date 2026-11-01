@@ -817,7 +817,7 @@ public static bool NeedsReasoningEcho(string model)
                 ["ttft_ms"] = qe != null && qe.TtftMs >= 0 ? qe.TtftMs : null,
                 ["est_usd_per_req"] = rate is null
                     ? null
-                    : Math.Round((s?.Reqs ?? 0) >= 10 ? s!.Usd / s.Reqs : Cost(m, mp, mc, mk), 8),
+                    : Math.Round((s?.Reqs ?? 0) >= 10 && (s?.Usd ?? 0) > 0 ? s!.Usd / s.Reqs : Cost(m, mp, mc, mk), 8),
                 ["input_per_1m"] = rate is null ? null : rate.Input,
                 ["output_per_1m"] = rate is null ? null : rate.Output,
                 ["debug_mp"] = mp,
