@@ -820,11 +820,6 @@ public static bool NeedsReasoningEcho(string model)
                     : Math.Round((s?.Reqs ?? 0) >= 10 && (s?.Usd ?? 0) > 0 ? s!.Usd / s.Reqs : Cost(m, mp, mc, mk), 8),
                 ["input_per_1m"] = rate is null ? null : rate.Input,
                 ["output_per_1m"] = rate is null ? null : rate.Output,
-                ["debug_mp"] = mp,
-                ["debug_mc"] = mc,
-                ["debug_mk"] = mk,
-                ["debug_rate_null"] = rate is null,
-                ["debug_cost_call"] = rate is null ? -1 : Cost(m, mp, mc, mk),
             });
         }
         return arr;
