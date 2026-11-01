@@ -46,7 +46,11 @@ var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
 var rankingPath = Path.Combine(AppContext.BaseDirectory, "ranking.html");
 
 // ---------------- model ranking (root) ----------------
-app.MapGet("/", () => Results.File(rankingPath, "text/html"));
+app.MapGet("/", (HttpContext ctx) =>
+{
+    ctx.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+    return Results.File(rankingPath, "text/html");
+});
 app.MapGet("/ui", () => Results.File(uiPath, "text/html"));
 app.MapGet("/status", () => Results.File(statusPath, "text/html"));
 
