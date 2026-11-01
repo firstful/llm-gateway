@@ -369,6 +369,7 @@ public sealed class ModelScorerService : BackgroundService
         public DateTimeOffset LastOk = DateTimeOffset.MinValue;
         public string LastError = "";
         public Dictionary<string, QualitySources.Entry> Quality = new();
+        public Dictionary<string, double> Scores = new();
         public DateTimeOffset QualityFetched = DateTimeOffset.MinValue;
     }
 
@@ -376,6 +377,7 @@ public sealed class ModelScorerService : BackgroundService
     static State S => _state;
 
     public static string[] Current => _state.Order;
+    public static double ScoreOf(string m) => _state.Scores.TryGetValue(m, out var v) ? v : 0;
 
     /// <summary>True when the last refresh saw a Go usage window that disqualifies
     /// paid models. Surfaced in /status.json so the gate is observable even
@@ -700,6 +702,8 @@ public static bool NeedsReasoningEcho(string model)
         });
 
         st.Order = viable.Select(r => r.Model).ToArray();
+        // keep score lookup in sync
+        st.Scores = viable.ToDictionary(r => r.Model, r => r.Score);
         st.LastOk = DateTimeOffset.UtcNow;
         st.LastError = "";
         _state = st;
@@ -818,6 +822,7 @@ public static bool NeedsReasoningEcho(string model)
                 ["est_usd_per_req"] = rate is null
                     ? null
                     : Math.Round((s?.Reqs ?? 0) >= 10 && (s?.Usd ?? 0) > 0 ? s!.Usd / s.Reqs : Cost(m, mp, mc, mk), 8),
+                ["score"] = Math.Round(_state.ScoreOf(m), 4),
                 ["input_per_1m"] = rate is null ? null : rate.Input,
                 ["output_per_1m"] = rate is null ? null : rate.Output,
             });
