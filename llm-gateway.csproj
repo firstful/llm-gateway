@@ -14,9 +14,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Chat UI served at / and /ui; status dashboard at /status -->
+    <!-- Chat UI served at /ui; status dashboard at /status; model ranking at / -->
     <Content Include="ui.html" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="status.html" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="ranking.html" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

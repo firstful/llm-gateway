@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llm-gateway model ranking</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; background: #0d1117; color: #e6edf3; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 14px 18px; border-bottom: 1px solid #21262d; position: sticky; top: 0; background: #0d1117; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sub { color: #8b93a3; font-size: 12px; }
+  header .clk { margin-left: auto; color: #8b93a3; font-size: 12px; font-variant-numeric: tabular-nums; }
+  main { padding: 16px 18px; display: flex; flex-direction: column; gap: 18px; }
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 14px; }
+  .card h2 { margin: 0 0 8px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .meta { color: #8b93a3; font-size: 12px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: #4ade80; } .dot.warn { background: #fbbf24; } .dot.bad { background: #f87171; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #21262d; text-align: left; white-space: nowrap; }
+  th { color: #8b93a3; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .free { color: #4ade80; } .paid { color: #a5b4cf; }
+  .blocked { color: #f87171; }
+  .pin { font-size: 12px; color: #fbbf24; }
+  .err { font-size: 11px; color: #f87171; white-space: pre-wrap; word-break: break-word; }
+  footer { padding: 10px 18px; color: #4b5358; font-size: 11px; }
+  a { color: #58a6ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>llm-gateway model ranking</h1>
+  <span class="sub" id="bash"></span>
+  <span class="clk" id="clk"></span>
+</header>
+<main>
+  <div class="card">
+    <h2>meta-model: auto <span class="meta" id="auto-meta"></span></h2>
+    <div id="pin" class="pin"></div>
+    <table><thead><tr>
+      <th>#</th><th>model</th><th>tier</th><th>free</th><th>reliability</th><th>quality</th><th>observed</th><th>ttft ms</th><th>est $/req</th>
+    </tr></thead><tbody id="auto-body"></tbody></table>
+  </div>
+  <div class="card">
+    <h2>meta-model: free <span class="meta" id="free-meta"></span></h2>
+    <table><thead><tr>
+      <th>#</th><th>model</th><th>tier</th><th>free</th><th>reliability</th><th>quality</th><th>observed</th><th>ttft ms</th><th>est $/req</th>
+    </tr></thead><tbody id="free-body"></tbody></table>
+  </div>
+</main>
+<footer>
+  data: <span id="src"></span> &middot; chat UI at <a href="/ui">/ui</a> &middot; status at <a href="/status">/status</a>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => (s ?? "").toString().replace(/[&<>\"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const tierName = (t) => t === 0 ? "free" : t === 1 ? "paid+bench" : "paid+unknown";
+
+function row(i, m) {
+  const cls = m.free ? "free" : "paid";
+  const blocked = m.quota_blocked ? " <span class='blocked'>(quota blocked)</span>" : "";
+  return `<tr>
+    <td class="num">${i + 1}</td>
+    <td class="${cls}">${esc(m.model)}${blocked}</td>
+    <td>${tierName(m.tier)}</td>
+    <td>${m.free ? "yes" : "no"}</td>
+    <td class="num">${m.reliability}</td>
+    <td class="num">${m.quality == null ? "—" : m.quality}</td>
+    <td class="num">${m.observed}</td>
+    <td class="num">${m.ttft_ms == null ? "—" : m.ttft_ms}</td>
+    <td class="num">${m.est_usd_per_req == null ? "—" : m.est_usd_per_req}</td>
+  </tr>`;
+}
+
+function renderList(bodyId, metaId, order, models) {
+  const byModel = new Map(models.map(m => [m.model, m]));
+  const rows = order.map((name, i) => {
+    const m = byModel.get(name) || { model: name, tier: 0, free: false, reliability: "—", quality: null, observed: 0, ttft_ms: null, est_usd_per_req: null, quota_blocked: false };
+    return row(i, m);
+  }).join("");
+  $(bodyId).innerHTML = rows || "<tr><td colspan='9' class='meta'>no ranking yet</td></tr>";
+  $(metaId).textContent = `${order.length} models`;
+}
+
+async function refresh() {
+  try {
+    const j = await (await fetch("/status.json")).json();
+    $("bash").textContent = `${esc(j.app)} v${esc(j.version)} · scorer ${j.scorer.ready ? "ready" : "loading"}`;
+    $("src").textContent = esc(j.ts);
+    const order = j.scorer.order || [];
+    const models = j.scorer.models || [];
+    renderList("auto-body", "auto-meta", order, models);
+    const freeOrder = order.filter(name => {
+      const m = models.find(x => x.model === name);
+      return m && m.free;
+    });
+    renderList("free-body", "free-meta", freeOrder, models);
+    const pin = j.scorer.pin || {};
+    $("pin").textContent = pin.pinned ? `operator pin: ${pin.model} (expires in ${pin.expires_in_s}s, fallback=${pin.fallback})` : "";
+  } catch (e) {
+    $("auto-body").innerHTML = `<tr><td colspan='9' class='err'>${esc(e)}</td></tr>`;
+  }
+}
+
+setInterval(() => { $("clk").textContent = new Date().toLocaleTimeString(); }, 1000);
+setInterval(refresh, 3000);
+refresh();
+</script>
+</body>
+</html>
+path: /tmp/llm-gateway-work/ranking.html

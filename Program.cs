@@ -43,9 +43,10 @@ MetricsStore.Load();
 ModelPin.Load();
 var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
 var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
+var rankingPath = Path.Combine(AppContext.BaseDirectory, "ranking.html");
 
-// ---------------- chat UI ----------------
-app.MapGet("/", () => Results.File(uiPath, "text/html"));
+// ---------------- model ranking (root) ----------------
+app.MapGet("/", () => Results.File(rankingPath, "text/html"));
 app.MapGet("/ui", () => Results.File(uiPath, "text/html"));
 app.MapGet("/status", () => Results.File(statusPath, "text/html"));
 
