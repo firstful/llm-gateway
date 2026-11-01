@@ -41,13 +41,13 @@
     <h2>meta-model: auto <span class="meta" id="auto-meta"></span></h2>
     <div id="pin" class="pin"></div>
     <table><thead><tr>
-      <th>#</th><th>model</th><th>tier</th><th>free</th><th>reliability</th><th>quality</th><th>observed</th><th>ttft ms</th><th>$in/1M</th><th>$out/1M</th><th>est $/req</th>
+      <th>#</th><th>model</th><th>tier</th><th>free</th><th>score</th><th>reliability</th><th>quality</th><th>observed</th><th>ttft ms</th><th>$in/1M</th><th>$out/1M</th><th>est $/req</th>
     </tr></thead><tbody id="auto-body"></tbody></table>
   </div>
   <div class="card">
     <h2>meta-model: free <span class="meta" id="free-meta"></span></h2>
     <table><thead><tr>
-      <th>#</th><th>model</th><th>tier</th><th>free</th><th>reliability</th><th>quality</th><th>observed</th><th>ttft ms</th><th>$in/1M</th><th>$out/1M</th><th>est $/req</th>
+      <th>#</th><th>model</th><th>tier</th><th>free</th><th>score</th><th>reliability</th><th>quality</th><th>observed</th><th>ttft ms</th><th>$in/1M</th><th>$out/1M</th><th>est $/req</th>
     </tr></thead><tbody id="free-body"></tbody></table>
   </div>
 </main>
@@ -73,6 +73,7 @@ function row(i, m) {
     <td class="${cls}">${esc(m.model)}${blocked}</td>
     <td>${tierName(m.tier)}</td>
     <td>${m.free ? "yes" : "no"}</td>
+    <td class="num">${m.score == null ? "—" : fmt(m.score)}</td>
     <td class="num">${m.reliability == null ? "—" : fmt(m.reliability)}</td>
     <td class="num">${m.quality == null ? "—" : fmt(m.quality)}</td>
     <td class="num">${m.observed}</td>
