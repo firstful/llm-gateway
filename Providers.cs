@@ -18,6 +18,7 @@ namespace LlmGateway;
 ///   auto / free   -> the scorer-ranked list (free tier first, gated on
 ///                     reliability, speed and the OpenCode Go quota windows);
 ///                     the serving path just walks it top to bottom
+///   auto-vision   -> like auto, but filtered to image-capable (multimodal) models
 ///
 /// Chat sessions persist server-side (SQLite + cookie), the UI shows live
 /// provider + local-LLM status.
@@ -322,7 +323,12 @@ public static class Providers
     {
         var ranked = ModelScorerService.Current;
         if (ranked.Length == 0) return new List<(string, string)>();
-        var picks = low == "free" ? Array.FindAll(ranked, ModelScorerService.IsFree) : ranked;
+        string[] picks = low switch
+        {
+            "free" => Array.FindAll(ranked, ModelScorerService.IsFree),
+            "auto-vision" or "vision" => Array.FindAll(ranked, ModelScorerService.IsMultimodal),
+            _ => ranked,
+        };
         return picks.Select(m => (Key: "ocg", Upstream: m)).ToList();
     }
 
@@ -337,7 +343,7 @@ public static class Providers
         var m = model!.Trim();
         var low = m.ToLowerInvariant();
 
-        if (low == "auto" || low == "free")
+        if (low is "auto" or "free" or "auto-vision" or "vision")
         {
             // An operator pin wins over the scorer, and is strict by default so
             // that a failure surfaces instead of being papered over by a
@@ -364,8 +370,11 @@ public static class Providers
             // There is no chain to fall back on any more -- the scorer retries
             // its first pass at startup precisely so this window stays tiny --
             // so fail loudly rather than serving an empty route list.
+            var hint = low is "auto-vision" or "vision"
+                ? " (no multimodal models ranked yet)"
+                : "";
             throw new ApiError(503,
-                $"model '{m}': the scorer's first ranking pass has not completed yet; retry in a few seconds");
+                $"model '{m}': the scorer's first ranking pass has not completed yet{hint}; retry in a few seconds");
         }
 
         foreach (var key in new[] { "or", "ocz", "ocg", "local" })
@@ -378,7 +387,7 @@ public static class Providers
         }
 
         throw new ApiError(404,
-            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/LOCAL-), 'auto', or 'free'.");
+            $"unknown model '{m}'. Use a provider prefix (OR-/OCZ-/OCG-/LOCAL-), 'auto', 'free', or 'auto-vision'.");
     }
 
     /// <summary>Fire one request at one provider. stream=true -> SSE relay path.</summary>

@@ -471,7 +471,11 @@ public static class Chat
         var body = await ParseBody(ctx);
         if (body is null) throw new ApiError(400, "request body must be JSON");
         if (HasImageContent(body!["messages"] as JsonArray))
-            throw new ApiError(400, "image input is disabled in llm-gateway. Send text-only requests.");
+        {
+            var _m = (model ?? "auto").Trim().ToLowerInvariant();
+            if (_m is not ("auto-vision" or "vision"))
+                throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' for multimodal requests.");
+        }
         var model = body!["model"]?.GetValue<string>();
         // Resolve the conversation once per request: with no cookie this does
         // an exact-prefix lookup, and every use below must see the same id.
@@ -969,7 +973,24 @@ public static class Chat
                 case "input_image":
                 case "image":
                 case "image_url":
-                    throw new ApiError(400, "image input is disabled in llm-gateway. Send text-only requests.");
+                {
+                    // pass through as a user message with image content part
+                    var url = item["image_url"]?.GetValue<string>() ?? item["url"]?.GetValue<string>() ?? item["file_id"]?.GetValue<string>();
+                    if (string.IsNullOrEmpty(url) && item["image_url"] is JsonObject iuo) url = iuo["url"]?.GetValue<string>();
+                    if (!string.IsNullOrEmpty(url))
+                    {
+                        messages.Add(new JsonObject
+                        {
+                            ["role"] = "user",
+                            ["content"] = new JsonArray(new JsonObject
+                            {
+                                ["type"] = "image_url",
+                                ["image_url"] = new JsonObject { ["url"] = url }
+                            })
+                        });
+                    }
+                    break;
+                }
                 default:
                     throw new ApiError(400, $"unsupported input item type '{type}'");
             }
@@ -1048,7 +1069,11 @@ public static class Chat
             foreach (var n in topIn)
             {
                 if (n is JsonObject o && (o["type"]?.GetValue<string>()?.ToLowerInvariant() is "input_image" or "image" or "image_url"))
-                    throw new ApiError(400, "image input is disabled in llm-gateway. Send text-only requests.");
+                {
+                    var _m = model.Trim().ToLowerInvariant();
+                    if (_m is not ("auto-vision" or "vision"))
+                        throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' for multimodal requests.");
+                }
             }
         }
 

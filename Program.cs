@@ -248,7 +248,7 @@ app.MapPost("/v1/session/clear", (HttpContext ctx) =>
 // ---------------- /v1/models ----------------
 app.MapGet("/v1/models", async () =>
 {
-    var ids = new List<string> { "auto", "free" };
+    var ids = new List<string> { "auto", "free", "auto-vision" };
     foreach (var p in Providers.All)
     {
         var served = await Providers.ProviderModelsAsync(p.Key);

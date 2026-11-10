@@ -339,6 +339,7 @@ public sealed class ModelScorerService : BackgroundService
         public string Model = "";
         public double Input, Output, CacheRead;
         public bool Reasoning;
+        public bool Multimodal;
         public string? InterleavedField;   // e.g. "reasoning_content", when set
         public List<(long Size, double In, double Out, double Cache)> Tiers = new();
         public bool IsFree => Input == 0 && Output == 0;
@@ -500,6 +501,16 @@ public static bool NeedsReasoningEcho(string model)
         return r is not null && r.IsFree;
     }
 
+    /// <summary>True when api.json declares image input for this model.</summary>
+    public static bool IsMultimodal(string model)
+    {
+        var r = _state.Rates.FirstOrDefault(x => x.Model == model);
+        return r is not null && r.Multimodal;
+    }
+
+    /// <summary>Scorer-ranked multimodal (image-capable) model ids, best first.</summary>
+    public static string[] CurrentMultimodal => Array.FindAll(_state.Order, IsMultimodal);
+
     /// <summary>Tier-aware cost. Picks the highest context threshold the request
     /// actually meets, matching how the vendor bills.</summary>
     public static double Cost(string model, long prompt, long completion, long cached)
@@ -532,6 +543,8 @@ public static bool NeedsReasoningEcho(string model)
                 // replayed assistant turns. Both come from the vendor rather
                 // than a hand-maintained list.
                 Reasoning = node?["reasoning"]?.GetValue<bool>() ?? false,
+                Multimodal = (node?["modalities"] as JsonObject)?["input"] is JsonArray mi
+                    && mi.Any(x => string.Equals(x?.GetValue<string>(), "image", StringComparison.OrdinalIgnoreCase)),
                 InterleavedField = (node?["interleaved"] as JsonObject)?["field"]?.GetValue<string>(),
             };
             if (c["tiers"] is JsonArray tiers)
@@ -806,6 +819,7 @@ public static bool NeedsReasoningEcho(string model)
             {
                 ["model"] = m,
                 ["free"] = isFree,
+                ["multimodal"] = rate?.Multimodal ?? false,
                 // 0 free, 1 paid+benchmarked, 2 paid+unknown-quality
                 ["tier"] = isFree ? 0 : (bench ? 1 : 2),
                 ["quota_blocked"] = isFree ? false : PaidSpendBlocked(_state.Quota),
