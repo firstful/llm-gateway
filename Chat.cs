@@ -470,13 +470,13 @@ public static class Chat
     {
         var body = await ParseBody(ctx);
         if (body is null) throw new ApiError(400, "request body must be JSON");
+        var model = body!["model"]?.GetValue<string>();
         if (HasImageContent(body!["messages"] as JsonArray))
         {
             var _m = (model ?? "auto").Trim().ToLowerInvariant();
             if (_m is not ("auto-vision" or "vision"))
                 throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' for multimodal requests.");
         }
-        var model = body!["model"]?.GetValue<string>();
         // Resolve the conversation once per request: with no cookie this does
         // an exact-prefix lookup, and every use below must see the same id.
         var sid = SessionId(ctx, body["messages"] as JsonArray);

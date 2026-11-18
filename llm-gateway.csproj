@@ -14,7 +14,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Chat UI served at /ui; status dashboard at /status; model ranking at / -->
+    <!-- Landing page at /; chat UI at /chat (legacy /ui); status at /status; model ranking at /ranking -->
+    <Content Include="index.html" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="ui.html" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="status.html" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="ranking.html" CopyToOutputDirectory="PreserveNewest" />

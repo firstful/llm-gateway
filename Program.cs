@@ -44,14 +44,19 @@ ModelPin.Load();
 var uiPath = Path.Combine(AppContext.BaseDirectory, "ui.html");
 var statusPath = Path.Combine(AppContext.BaseDirectory, "status.html");
 var rankingPath = Path.Combine(AppContext.BaseDirectory, "ranking.html");
+var indexPath = Path.Combine(AppContext.BaseDirectory, "index.html");
 
-// ---------------- model ranking (root) ----------------
-app.MapGet("/", (HttpContext ctx) =>
+// ---------------- landing page (root) ----------------
+app.MapGet("/", () => Results.File(indexPath, "text/html"));
+// ---------------- chat UI (canonical /chat, /ui kept as legacy alias) -------
+app.MapGet("/chat", () => Results.File(uiPath, "text/html"));
+app.MapGet("/ui", () => Results.File(uiPath, "text/html"));
+// ---------------- model ranking ----------------
+app.MapGet("/ranking", (HttpContext ctx) =>
 {
     ctx.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
     return Results.File(rankingPath, "text/html");
 });
-app.MapGet("/ui", () => Results.File(uiPath, "text/html"));
 app.MapGet("/status", () => Results.File(statusPath, "text/html"));
 
 // ---------------- health ----------------

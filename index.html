@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llm-gateway</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #0d1117; color: #e6edf3;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .wrap { width: 100%; max-width: 640px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: #8b93a3; margin: 0 0 22px; font-size: 13px; }
+  .cards { display: grid; gap: 12px; }
+  a.card { display: block; padding: 18px 20px; background: #161b22; border: 1px solid #21262d;
+           border-radius: 10px; color: inherit; text-decoration: none; transition: border-color .15s, background .15s; }
+  a.card:hover { border-color: #58a6ff; background: #1c2230; }
+  a.card h2 { font-size: 15px; margin: 0 0 4px; color: #58a6ff; }
+  a.card p { margin: 0; color: #8b93a3; font-size: 13px; }
+  a.card .path { float: right; font: 12px ui-monospace, monospace; color: #6b7280; }
+  footer { margin-top: 20px; color: #4b5358; font-size: 11px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>llm-gateway</h1>
+  <p class="sub">OpenAI-compatible multi-provider LLM gateway &middot; pick a page</p>
+  <div class="cards">
+    <a class="card" href="/chat"><span class="path">/chat</span><h2>Chat</h2><p>Talk to a model (auto / free / auto-vision and provider models), with saved sessions.</p></a>
+    <a class="card" href="/ranking"><span class="path">/ranking</span><h2>Model ranking</h2><p>Live scorer ranking of the auto + free meta-models with score, reliability and cost.</p></a>
+    <a class="card" href="/status"><span class="path">/status</span><h2>Provider status</h2><p>Provider reachability, latency, advertised models and recent request success rates.</p></a>
+  </div>
+  <footer>Also: <a href="/health">/health</a> &middot; <a href="/stats">/stats</a> &middot; <a href="/v1/models">/v1/models</a></footer>
+</div>
+</body>
+</html>
