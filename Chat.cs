@@ -105,9 +105,9 @@ public static class Chat
 
     /// <summary>Whether any message in the conversation carries an image
     /// (OpenAI chat-style `image_url` parts or Responses-style `input_image`
-    /// items). The gateway is text-only for now: image requests cost upstream
-    /// credits, so we reject them up front before resolving a provider.</summary>
-    static bool HasImageContent(JsonArray? messages)
+    /// items). Image requests bill upstream credits, so the gateway routes
+    /// them only through an explicitly multimodal model.</summary>
+    static bool HasImageInput(JsonArray? messages)
     {
         if (messages is null) return false;
         foreach (var m in messages)
@@ -128,6 +128,18 @@ public static class Chat
             }
         }
         return false;
+    }
+
+    /// <summary>Upgrade a plain `auto` request to `auto-vision` when it carries
+    /// an image, so callers never have to know the alias. Any other model
+    /// (including `free`, operator pins, and explicit provider models) is
+    /// unchanged; the image gate below still rejects those. Returns the model
+    /// the gateway should actually resolve and report.</summary>
+    static string? AutoVisionForImage(string? model, bool hasImage)
+    {
+        if (!hasImage) return model;
+        var m = (model ?? "auto").Trim();
+        return m.Equals("auto", StringComparison.OrdinalIgnoreCase) ? "auto-vision" : model;
     }
 
     /// <summary>Reconstruct assistant content from OpenAI SSE stream bytes.</summary>
@@ -471,12 +483,15 @@ public static class Chat
         var body = await ParseBody(ctx);
         if (body is null) throw new ApiError(400, "request body must be JSON");
         var model = body!["model"]?.GetValue<string>();
-        if (HasImageContent(body!["messages"] as JsonArray))
-        {
-            var _m = (model ?? "auto").Trim().ToLowerInvariant();
-            if (_m is not ("auto-vision" or "vision"))
-                throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' for multimodal requests.");
-        }
+        var hasImage = HasImageInput(body!["messages"] as JsonArray);
+        model = AutoVisionForImage(model, hasImage);
+        body["model"] = model;
+        if (hasImage && (model ?? "auto").Trim().ToLowerInvariant() is not ("auto-vision" or "vision"))
+            throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' or 'auto' for multimodal requests.");
+        // An auto->auto-vision upgrade is transparent to the client, but keep
+        // the requested alias in a header for attribution alongside X-LLM-Model.
+        if (hasImage && string.Equals(model, "auto-vision", StringComparison.OrdinalIgnoreCase))
+            ctx.Response.Headers["X-LLM-Model-Requested"] = "auto";
         // Resolve the conversation once per request: with no cookie this does
         // an exact-prefix lookup, and every use below must see the same id.
         var sid = SessionId(ctx, body["messages"] as JsonArray);
@@ -1061,21 +1076,24 @@ public static class Chat
 
         var model = body["model"]?.GetValue<string>() ?? "auto";
 
-        // Block image payloads supplied as top-level input items up front, so
-        // we never spend credits upstream. ResponsesInputToMessages would
-        // otherwise silently drop `input_image` items.
+        // Responses `input_image` items are real image content: ResponseInputToMessages
+        // maps them to image_url parts. Upgrade `auto` the same way as the chat
+        // endpoint so images don't get silently dropped or rejected.
+        var hasImage = false;
         if (body["input"] is JsonArray topIn)
         {
             foreach (var n in topIn)
             {
                 if (n is JsonObject o && (o["type"]?.GetValue<string>()?.ToLowerInvariant() is "input_image" or "image" or "image_url"))
-                {
-                    var _m = model.Trim().ToLowerInvariant();
-                    if (_m is not ("auto-vision" or "vision"))
-                        throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' for multimodal requests.");
-                }
+                    hasImage = true;
             }
         }
+        model = AutoVisionForImage(model, hasImage)!;
+        body["model"] = model;
+        if (hasImage && model.Trim().ToLowerInvariant() is not ("auto-vision" or "vision"))
+            throw new ApiError(400, "image input is disabled for this model. Use model 'auto-vision' or 'auto' for multimodal requests.");
+        if (hasImage && string.Equals(model, "auto-vision", StringComparison.OrdinalIgnoreCase))
+            ctx.Response.Headers["X-LLM-Model-Requested"] = "auto";
 
         // translate Responses API request -> chat.completions request
         var chatPayload = new JsonObject
